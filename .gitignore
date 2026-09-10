@@ -1,0 +1,27 @@
+# Internal planning documents
+/my_docs
+
+# Go build and test output
+/grin
+*.test
+coverage.out
+coverage.html
+/vendor/
+
+# Local agent/runtime state
+/.agent-harness/
+/tmp/
+/dist/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# macOS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
