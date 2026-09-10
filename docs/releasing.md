@@ -10,7 +10,7 @@ Confirm that:
 - the repository is available at `duongnvt2110/grin`;
 - the default branch is `main`;
 - GitHub Actions has **Read and write permissions** for repository contents;
-- `.github/workflows/release.yml` is present;
+- `.github/workflows/ci.yml` and `.github/workflows/release.yml` are present;
 - the working tree contains the intended source and documentation.
 
 The release workflow uses GitHub's automatic `GITHUB_TOKEN`. No personal token
@@ -54,8 +54,9 @@ git tag "$VERSION"
 git push origin "$VERSION"
 ```
 
-The tag starts the `Release` workflow. GoReleaser creates release notes from
-GitHub history and uploads the archives and checksum file.
+Run `Grin CI` on the target commit before creating the release tag. The tag
+starts the separate `Grin Release` workflow, which uses GoReleaser to publish
+release notes, archives, and the checksum file.
 
 ## Verify the GitHub Release
 

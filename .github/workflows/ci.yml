@@ -1,11 +1,14 @@
-name: ci
+name: Grin CI
 
 on:
   push:
+    branches:
+      - "**"
   pull_request:
 
 jobs:
   test:
+    name: Test (Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
