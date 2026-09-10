@@ -42,7 +42,13 @@ As a manual fallback, download the matching archive and `checksums.txt` from
 the [GitHub Releases](https://github.com/duongnvt2110/grin/releases) page:
 
 ```zsh
+VERSION=v0.1.0
 ARCHIVE=grin_Darwin_arm64.tar.gz # choose the matching OS and architecture
+BASE_URL="https://github.com/duongnvt2110/grin/releases/download/$VERSION"
+mkdir -p /tmp/grin-release
+cd /tmp/grin-release
+curl -fsSLO "$BASE_URL/$ARCHIVE"
+curl -fsSLO "$BASE_URL/checksums.txt"
 grep "  $ARCHIVE$" checksums.txt | shasum -a 256 -c -
 tar -xzf "$ARCHIVE"
 mkdir -p ~/.local/bin
@@ -51,10 +57,19 @@ install -m 0755 grin ~/.local/bin/grin
 
 On Linux, replace `shasum -a 256 -c -` with `sha256sum -c -`.
 
+If no release is available yet, run from a source checkout:
+
+```zsh
+git clone git@github.com:duongnvt2110/grin.git
+cd grin
+go run ./cmd/grin --workspace /tmp/grin-demo
+```
+
 ## Required accounts and software
 
 - An installed Grin binary or a runnable Grin checkout.
 - A workspace directory.
+- Go 1.26.6 or newer when running from source.
 - The official OpenAI `tunnel-client`.
 - An OpenAI organization with access to Tunnels management.
 - A single-operator tunnel.

@@ -44,6 +44,12 @@ curl -fsSL https://raw.githubusercontent.com/duongnvt2110/grin/main/scripts/inst
 The installer places `grin` in `~/.local/bin` and verifies the release
 checksum. It does not install `tunnel-client`.
 
+If no GitHub release is available yet, run Grin from a Go checkout instead:
+
+```zsh
+go run ./cmd/grin --workspace /tmp/grin-demo
+```
+
 ### Run Grin locally
 
 Start Grin with an explicit workspace:
@@ -98,6 +104,11 @@ Grin currently provides:
 
 See [implemented features and boundaries](docs/features.md) for the current
 security model and deferred work.
+
+For the architecture and deployment process, see:
+
+- [Grin components](docs/components.md)
+- [Release guide](docs/releasing.md)
 
 ## Safety model
 
