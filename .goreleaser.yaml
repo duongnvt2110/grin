@@ -1,0 +1,28 @@
+version: 2
+
+builds:
+  - main: ./cmd/grin
+    binary: grin
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "grin_{{ title .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: github-native
+
+release:
+  github:
+    owner: duongnvt2110
+    name: grin
