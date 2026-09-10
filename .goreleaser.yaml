@@ -26,3 +26,7 @@ release:
   github:
     owner: duongnvt2110
     name: grin
+  header: |
+    ## Grin {{ .Tag }}
+
+    See the [project changelog](https://github.com/duongnvt2110/grin/blob/{{ .Tag }}/CHANGELOG.md) for the full history.

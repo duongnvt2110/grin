@@ -11,6 +11,7 @@ Confirm that:
 - the default branch is `main`;
 - GitHub Actions has **Read and write permissions** for repository contents;
 - `.github/workflows/ci.yml` and `.github/workflows/release.yml` are present;
+- `CHANGELOG.md` contains the intended release history;
 - the working tree contains the intended source and documentation.
 
 The release workflow uses GitHub's automatic `GITHUB_TOKEN`. No personal token
@@ -57,6 +58,11 @@ git push origin "$VERSION"
 Run `Grin CI` on the target commit before creating the release tag. The tag
 starts the separate `Grin Release` workflow, which uses GoReleaser to publish
 release notes, archives, and the checksum file.
+
+GoReleaser keeps the GitHub-native changelog and adds a short link to
+`CHANGELOG.md` in the release notes. Update the `Unreleased` section before
+the next version, then move its entries under the new version heading after
+the release is published.
 
 ## Verify the GitHub Release
 
