@@ -1,4 +1,23 @@
-# Grin
+# Connect Grin to ChatGPT with Secure MCP Tunnel
+
+This is the complete first-time tutorial for connecting a local Grin process to ChatGPT.
+For a local-only quick start, CLI options, and mode concepts, read the
+[README](../README.md) first.
+
+This tutorial uses **normal multi-workspace mode**. Read the
+[normal vs YOLO comparison](../README.md#modes) before choosing `--yolo`.
+
+## Setup map
+
+| Step | Outcome |
+| --- | --- |
+| 1. Install Grin | `grin` is available locally |
+| 2. Install `tunnel-client` | the official tunnel runtime is available |
+| 3. Create/select tunnel + runtime key | you have a tunnel ID and restricted runtime API key |
+| 4. Register workspaces and start Grin | local MCP endpoint is healthy/ready |
+| 5. Run `tunnel-client` | the local MCP endpoint is connected to the OpenAI tunnel |
+| 6. Connect ChatGPT | ChatGPT can discover Grin tools |
+| 7. Run the end-to-end checks | workspace routing, approvals, tools, and TUI are verified |
 
 ## What this setup does
 
@@ -19,7 +38,7 @@ ChatGPT
 
 Grin remains loopback-only. Do not expose Grin on a public address or port.
 
-## Install Grin
+## 1. Install Grin
 
 Install the latest macOS or Linux binary into `~/.local/bin`:
 
@@ -37,6 +56,15 @@ curl -fsSL https://raw.githubusercontent.com/duongnvt2110/grin/main/scripts/inst
 The installer verifies the selected release archive with its SHA-256 checksum.
 It supports macOS and Linux on amd64 and arm64, installs to `~/.local/bin` by
 default, and does not install `tunnel-client`.
+
+Add the default install directory to the current shell's `PATH`, then verify the
+installed binary:
+
+```zsh
+export PATH="$HOME/.local/bin:$PATH"
+command -v grin
+grin --version
+```
 
 As a manual fallback, download the matching archive and `checksums.txt` from
 the [GitHub Releases](https://github.com/duongnvt2110/grin/releases) page:
@@ -57,15 +85,60 @@ install -m 0755 grin ~/.local/bin/grin
 
 On Linux, replace `shasum -a 256 -c -` with `sha256sum -c -`.
 
-If no release is available yet, run from a source checkout:
+To upgrade an installed release later:
 
 ```zsh
-git clone git@github.com:duongnvt2110/grin.git
-cd grin
-go run ./cmd/grin --workspace /tmp/grin-demo
+grin upgrade
 ```
 
-## Required accounts and software
+The command checks the latest stable GitHub release, verifies the same
+GoReleaser SHA-256 checksum used by the installer, and atomically replaces the
+current Grin binary. It does not use `sudo` automatically; the install directory
+must be writable. Source/development builds do not self-upgrade.
+
+If no release is available yet, clone the source and verify the checkout. Start
+Grin later in the dedicated startup step:
+
+```zsh
+git clone https://github.com/duongnvt2110/grin.git
+cd grin
+go run ./cmd/grin --version
+```
+
+## 2. Install the official `tunnel-client`
+
+`tunnel-client` is a separate OpenAI project. Grin does not bundle or install
+it.
+
+On macOS, the official project recommends Homebrew:
+
+```zsh
+brew install openai/tools/tunnel-client
+tunnel-client --version
+tunnel-client help quickstart
+```
+
+On Linux, use an official Linux amd64/arm64 release from the
+[`tunnel-client` releases](https://github.com/openai/tunnel-client/releases/latest),
+or build the official source:
+
+```zsh
+git clone https://github.com/openai/tunnel-client.git
+cd tunnel-client
+mkdir -p bin
+go build -o bin/tunnel-client ./cmd/client
+export PATH="$PWD/bin:$PATH"
+command -v tunnel-client
+tunnel-client --version
+```
+
+If you build `tunnel-client` from source, keep this shell open and use it as
+Terminal B below so the temporary `PATH` entry remains available.
+
+Keep the `tunnel-client` version/installation instructions from its official
+repository authoritative; Grin only documents the integration points it needs.
+
+## 3. Required accounts and software
 
 - An installed Grin binary or a runnable Grin checkout.
 - A workspace directory.
@@ -82,7 +155,7 @@ documentation does not state a separate per-tunnel price. OpenAI organization,
 ChatGPT, or API usage may have separate plan or usage charges; confirm billing
 in your organization before creating a tunnel.
 
-## Canonical setup pages
+### Canonical setup pages
 
 | Page | Purpose |
 | --- | --- |
@@ -93,7 +166,7 @@ in your organization before creating a tunnel.
 
 Do not use an admin key as the long-running runtime key.
 
-## Create the tunnel and runtime key
+## 4. Create the tunnel and runtime key
 
 ### Personal ChatGPT: use the default workspace
 
@@ -138,18 +211,33 @@ tunnel-client admin tunnels update
 tunnel-client admin tunnels delete
 ```
 
-## Configure values without exposing secrets
+## 5. Configure values without exposing secrets
 
-In the terminal where you will run Grin and `tunnel-client`, enter the values
-without putting the runtime key in shell history:
+For the recommended foreground setup, use two terminals:
 
-```zsh
-read -r "CONTROL_PLANE_TUNNEL_ID?Tunnel ID: "
+- **Terminal A:** start Grin and leave it running.
+- **Terminal B:** configure the tunnel values, verify Grin, and run
+  `tunnel-client`.
+
+If `~/.local/bin` is not already on your shell `PATH`, run this once in each
+new terminal that needs the installed `grin` command:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+In Terminal B, enter the tunnel values without putting the runtime key in shell
+history. These commands work in Bash and zsh:
+
+```sh
+printf 'Tunnel ID: '
+IFS= read -r CONTROL_PLANE_TUNNEL_ID
 export CONTROL_PLANE_TUNNEL_ID
 
-read -r -s "CONTROL_PLANE_API_KEY?Runtime API key: "
+printf 'Runtime API key: '
+IFS= read -r -s CONTROL_PLANE_API_KEY
+printf '\n'
 export CONTROL_PLANE_API_KEY
-echo
 
 export MCP_SERVER_URL=http://127.0.0.1:8765/mcp
 ```
@@ -157,9 +245,51 @@ export MCP_SERVER_URL=http://127.0.0.1:8765/mcp
 Never commit, echo, log, screenshot, or paste the API key. Do not store these
 values in Grin source files.
 
-## Start and verify Grin
+## 6. Register workspaces, start Grin, and verify readiness
 
-Use a visible terminal for Grin so you can answer approval prompts:
+Use Terminal A for Grin so you can answer approval prompts while Terminal B
+remains available for verification and `tunnel-client`:
+
+For a copy/paste disposable workspace:
+
+```zsh
+mkdir -p /tmp/grin-demo
+grin init --workspace /tmp/grin-demo
+```
+
+For real multi-workspace use, register each existing project once:
+
+```zsh
+grin init --workspace /path/to/project-a
+grin init --workspace /path/to/project-b
+```
+
+If Grin is being run only from source, run the same `init` command from the
+Grin checkout, for example:
+
+```zsh
+(cd /path/to/grin && go run ./cmd/grin init --workspace /tmp/grin-demo)
+```
+
+The command creates `<workspace>/.grin/config.yaml` when it is missing and adds
+the canonical path to `~/.grin/config.yaml`. A newly created workspace config
+shows the default shell environment allow-list:
+
+```yaml
+version: 1
+shell:
+  allowed_environment:
+    - PATH
+    - LANG
+    - LC_ALL
+```
+
+If the config was created by an older `grin init` and contains only the exact
+legacy `version: 1` file, running `grin init` again upgrades it. Customized
+configs are preserved unchanged, and omitted settings continue to use Grin's
+built-in defaults. The running Grin process reads the registry for
+`workspace.list` and each workspace-scoped request, so a new registration is
+available without restarting Grin.
 
 When running from inside a workspace, Grin can discover the workspace
 automatically by walking upward to the nearest `.grin/config.yaml`:
@@ -169,16 +299,17 @@ cd project/internal/mcp
 grin
 ```
 
-You can also select a workspace explicitly:
-
-```zsh
-go run ./cmd/grin --workspace /tmp/grin-demo
-```
-
-Or run an installed binary:
+Start an installed binary explicitly:
 
 ```zsh
 grin --workspace /tmp/grin-demo
+```
+
+From a source checkout, use the equivalent from the Grin repository in
+Terminal A:
+
+```zsh
+go run ./cmd/grin --workspace /tmp/grin-demo
 ```
 
 For an explicit YOLO session:
@@ -193,11 +324,21 @@ input validation, output limits, timeouts, cancellation, and process cleanup.
 Use it only when you intentionally want those Grin restrictions bypassed.
 `grin doctor --yolo` is not supported.
 
-In a second terminal, verify the local boundary:
+While Grin remains running in Terminal A, verify the local boundary from
+Terminal B:
 
 ```zsh
-go run ./cmd/grin doctor --workspace /tmp/grin-demo --check-ready
+grin doctor --workspace /tmp/grin-demo --check-ready
 curl -fsS http://127.0.0.1:8765/healthz
+curl -fsS http://127.0.0.1:8765/readyz
+```
+
+If Grin is being run only from source, replace the `grin doctor ...` line with
+a command that runs from the Grin checkout without changing Terminal B's
+working directory:
+
+```zsh
+(cd /path/to/grin && go run ./cmd/grin doctor --workspace /tmp/grin-demo --check-ready)
 ```
 
 Expected results include:
@@ -216,13 +357,13 @@ The MCP target for the tunnel client is always:
 http://127.0.0.1:8765/mcp
 ```
 
-## Run the tunnel client
+## 7. Run the tunnel client
 
 The client must remain running while ChatGPT uses the connector.
 
-### Foreground mode
+### Recommended: foreground mode
 
-Create a profile, validate it, and run it in the current terminal:
+Create a `tunnel-client` connection profile, validate it, and run it in the current terminal:
 
 ```zsh
 tunnel-client init \
@@ -237,7 +378,13 @@ tunnel-client doctor --profile grin --explain
 tunnel-client run --profile grin
 ```
 
-### Managed background mode
+Before continuing to ChatGPT, confirm all three conditions:
+
+- `tunnel-client doctor --profile grin --explain` succeeds.
+- Grin's `http://127.0.0.1:8765/readyz` endpoint returns HTTP `200`.
+- `tunnel-client run --profile grin` is still running in its terminal.
+
+### Optional: managed background runtime
 
 Use managed runtime supervision when you do not want to keep the tunnel
 terminal attached. Do not use `nohup` or `disown`:
@@ -263,7 +410,7 @@ tunnel-client runtimes stop grin
 Managed tunnel supervision does not replace Grin supervision. Grin must also
 remain running and ready.
 
-## Connect ChatGPT
+## 8. Connect ChatGPT
 
 After `tunnel-client` is healthy:
 
@@ -276,26 +423,30 @@ After `tunnel-client` is healthy:
 If the tunnel is not listed, check the workspace scope, connector permissions,
 the tunnel ID, and the local `/readyz` result.
 
-## Test Grin end to end
+## 9. Test Grin end to end
 
 Run these tests from ChatGPT in order:
 
 1. Call `system.info`; confirm that only non-secret system information is
    returned.
-2. Call `workspace.info`; confirm that the configured workspace is reported.
-3. Request `fs.write_text` for `approved.txt` inside the workspace; verify it
+2. Call `workspace.list`; copy an exact absolute path from the result.
+3. Call `workspace.info` with that path; confirm that the selected workspace is
+   reported.
+4. Request `fs.write_text` with the same `workspace` path for `approved.txt`;
+   verify it
    completes without approval.
-4. Request `fs.edit_text` to replace one exact occurrence in that file; verify
+5. Request `fs.edit_text` with the same `workspace` path to replace one exact
+   occurrence in that file; verify
    the content changes and the file remains readable.
-5. Request `git.status`, `git.diff`, `git.log`, and `git.show` when the
-   workspace is a simple Git repository; verify bounded results.
-6. Request a harmless `shell.run` operation; verify it completes without
+6. Request `git.status`, `git.diff`, `git.log`, and `git.show` with that
+   `workspace` path when it is a simple Git repository; verify bounded results.
+7. Request a harmless `shell.run` operation with that `workspace` path; verify it completes without
    approval.
-7. Request an obvious destructive shell command; confirm the TUI pauses for
+8. Request an obvious destructive shell command; confirm the TUI pauses for
    approval, reject it, and verify there is no side effect.
-8. Request an outside workspace write or shell `cwd`; confirm approval is
+9. Request an outside workspace write or shell `cwd`; confirm approval is
    required, then approve one and verify the operation completes.
-9. Confirm the Grin TUI records each request and resolution.
+10. Confirm the Grin TUI records each request and resolution with its workspace.
 
 For repository searches, use `fs.search` for simple text or file-name queries.
 Use `shell.run` with `rg` for regex, glob, file-type, or ignored-file searches
@@ -310,7 +461,7 @@ test -f /tmp/grin-demo/approved.txt && echo approved_write_passed
 Record only redacted output. Never record API keys, tunnel IDs, cookies,
 authorization headers, or raw environment values.
 
-## Troubleshooting
+## 10. Troubleshooting
 
 ### `tunnel-client` says the tunnel ID is missing
 
@@ -360,18 +511,18 @@ available. Run `doctor --check-ready` again after startup.
 
 In normal mode, check the Grin TUI when the operation is expected to require
 approval. Inside workspace writes and normal shell commands run after policy
-and validation checks. Outside reads are allowed in `workspace` mode. Outside
+and validation checks. Outside reads are allowed in normal mode. Outside
 writes, outside shell `cwd`, and obvious destructive shell commands require
 approval. Rejection, timeout, cancellation, policy denial, or failed approval
 delivery must prevent the side effect. YOLO sessions intentionally bypass
 Grin approval prompts for supported tools.
 
-## Security boundary
+## 11. Security boundary
 
 Grin V1 provides:
 
 - Loopback-only MCP binding.
-- In `workspace` mode, outside reads are allowed; outside writes and outside
+- In normal mode, outside reads are allowed; outside writes and outside
   shell `cwd` require approval.
 - Obvious destructive shell commands require approval. Grin is not a complete
   shell or filesystem sandbox.
@@ -388,7 +539,7 @@ system account. Kernel or administrator compromise, advanced filesystem
 time-of-check/time-of-use attacks, tunnel-provider compromise, and actions
 explicitly approved by the operator remain outside the V1 threat model.
 
-## Development verification
+## 12. Development verification
 
 From the repository root:
 

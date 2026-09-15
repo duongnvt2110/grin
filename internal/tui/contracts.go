@@ -70,6 +70,7 @@ func (s TranscriptState) IsTerminal() bool {
 type TranscriptEntry struct {
 	EventID           string
 	ToolCallID        string
+	Workspace         string
 	Tool              string
 	Summary           string
 	Detail            string
@@ -87,7 +88,7 @@ type renderedEntry struct {
 
 type Model struct {
 	Workspace string
-	Profile   string
+	Mode      string
 	Yolo      bool
 	Connected bool
 
@@ -107,9 +108,9 @@ type Model struct {
 	actionSink func(Action)
 }
 
-func NewModel(workspace, profile string, readiness *Readiness, yolo ...bool) Model {
+func NewModel(workspace, mode string, readiness *Readiness, yolo ...bool) Model {
 	enabled := len(yolo) > 0 && yolo[0]
-	return Model{Workspace: workspace, Profile: profile, Yolo: enabled, Connected: true, SeenEventIDs: map[string]struct{}{}, MaxEntries: 1000, readiness: readiness}
+	return Model{Workspace: workspace, Mode: mode, Yolo: enabled, Connected: true, SeenEventIDs: map[string]struct{}{}, MaxEntries: 1000, readiness: readiness}
 }
 
 func (m *Model) Attach(stream <-chan events.Event) { m.stream = stream }
@@ -183,7 +184,7 @@ func (m Model) updateKey(key string) (tea.Model, tea.Cmd) {
 }
 
 func canExpand(entry TranscriptEntry) bool {
-	if entry.State == StateAwaitingApproval {
+	if entry.State == StateAwaitingApproval || entry.Workspace != "" {
 		return true
 	}
 	if entry.Detail == "" {
@@ -275,12 +276,15 @@ func (m *Model) findEntry(toolCallID string) int {
 }
 
 func entryFrom(event events.Event, state TranscriptState) TranscriptEntry {
-	return TranscriptEntry{EventID: event.ID, ToolCallID: event.ToolCallID, Tool: event.Tool, Summary: event.Summary, Detail: event.Detail, Risk: event.Risk, State: state, ApprovalRequestID: event.ApprovalRequestID, OperationDigest: event.OperationDigest, ApprovalOutcome: event.ApprovalOutcome}
+	return TranscriptEntry{EventID: event.ID, ToolCallID: event.ToolCallID, Workspace: event.Workspace, Tool: event.Tool, Summary: event.Summary, Detail: event.Detail, Risk: event.Risk, State: state, ApprovalRequestID: event.ApprovalRequestID, OperationDigest: event.OperationDigest, ApprovalOutcome: event.ApprovalOutcome}
 }
 
 func (m *Model) mergeEvent(entry *TranscriptEntry, event events.Event, next TranscriptState, known bool) {
 	if entry.Tool == "" {
 		entry.Tool = event.Tool
+	}
+	if entry.Workspace == "" {
+		entry.Workspace = event.Workspace
 	}
 	if entry.Summary == "" || (!entry.State.IsTerminal() && event.Summary != "" && !genericSummary(event.Summary)) {
 		entry.Summary = event.Summary
@@ -401,7 +405,7 @@ func (m Model) View() tea.View {
 	if m.Help {
 		footerLines = append(footerLines, "Select the row marked >. Approval actions apply only to a pending approval.")
 	}
-	footerLines = append(footerLines, "", "────────────────────────────────────────────────────────────", connection+"   "+m.Workspace+"   "+m.Profile+"   active: "+activeCount(m.Entries))
+	footerLines = append(footerLines, "", "────────────────────────────────────────────────────────────", connection+"   "+m.Workspace+"   "+m.Mode+"   active: "+activeCount(m.Entries))
 	blocks, selectedStartLine, selectedEndLine := m.renderEntries()
 	body := flattenRenderedEntries(blocks)
 	available := len(body)
@@ -469,6 +473,9 @@ func (m Model) renderEntries() ([]renderedEntry, int, int) {
 		line := marker + " " + icon + " " + entry.Tool + "   " + entry.Summary
 		if label != "" {
 			line += " · " + label
+		}
+		if entry.Workspace != "" {
+			line += " · " + entry.Workspace
 		}
 		block := renderedEntry{Lines: []string{line}}
 		if entry.Expanded {

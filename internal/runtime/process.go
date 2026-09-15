@@ -1,15 +1,21 @@
 package runtime
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 )
 
+var sensitiveNamePattern = regexp.MustCompile(`(?i)(token|password|passwd|secret|api[-_.]?key|private[-_.]?key|credential|auth)`)
+var assignmentPattern = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)=(.*)$`)
+
 // RedactCommand returns a safe display form for command approval and process
 // metadata. It never changes the command that is executed.
 func RedactCommand(command string, args []string) string {
-	fields := append([]string{command}, args...)
-	return redactProcessText(strings.Join(fields, " "))
+	fields := make([]string, 1, len(args)+1)
+	fields[0] = command
+	fields = append(fields, args...)
+	return strings.Join(redactProcessFields(fields), " ")
 }
 
 func parseProcesses(output string) []Process {
@@ -42,13 +48,20 @@ func parseProcesses(output string) []Process {
 }
 
 func redactProcessText(value string) string {
-	fields := strings.Fields(value)
+	return strings.Join(redactProcessFields(strings.Fields(value)), " ")
+}
+
+func redactProcessFields(fields []string) []string {
 	redacted := make([]string, 0, len(fields))
 	redactNext := false
 	for _, field := range fields {
 		if redactNext {
 			redacted = append(redacted, "<redacted>")
 			redactNext = false
+			continue
+		}
+		if match := assignmentPattern.FindStringSubmatch(field); match != nil {
+			redacted = append(redacted, match[1]+"=<redacted>")
 			continue
 		}
 		if redactedURL, ok := redactURLCredentials(field); ok {
@@ -67,7 +80,7 @@ func redactProcessText(value string) string {
 		}
 		redacted = append(redacted, field)
 	}
-	return strings.Join(redacted, " ")
+	return redacted
 }
 
 func redactURLCredentials(value string) (string, bool) {
@@ -85,11 +98,5 @@ func redactURLCredentials(value string) (string, bool) {
 }
 
 func sensitiveProcessName(value string) bool {
-	value = strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(value, "-", "_"), ".", "_"))
-	for _, marker := range []string{"TOKEN", "PASSWORD", "PASSWD", "SECRET", "API_KEY", "PRIVATE_KEY", "CREDENTIAL", "AUTH"} {
-		if strings.Contains(value, marker) {
-			return true
-		}
-	}
-	return false
+	return sensitiveNamePattern.MatchString(value)
 }

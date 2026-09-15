@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"grin/internal/config"
@@ -20,6 +21,64 @@ func testService(t *testing.T) (*Service, string) {
 		t.Fatal(err)
 	}
 	return service, root
+}
+
+func TestRedactSensitiveContent(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "password", input: "PASSWORD=secret", want: "PASSWORD=<redacted>"},
+		{name: "spacing", input: "PASSWORD = secret", want: "PASSWORD = <redacted>"},
+		{name: "quoted json", input: `"api_key": "secret",`, want: `"api_key": "<redacted>",`},
+		{name: "camel secret", input: "clientSecret=secret", want: "clientSecret=<redacted>"},
+		{name: "refresh token", input: "refresh_token=secret", want: "refresh_token=<redacted>"},
+		{name: "provider key", input: "OPENAI_API_KEY=secret", want: "OPENAI_API_KEY=<redacted>"},
+		{name: "token metadata", input: "TOKEN_LIMIT=8192", want: "TOKEN_LIMIT=8192"},
+		{name: "password metadata", input: "PASSWORD_POLICY=min12", want: "PASSWORD_POLICY=min12"},
+		{name: "author", input: "AUTHOR=alice", want: "AUTHOR=alice"},
+		{name: "public key", input: "public_key=value", want: "public_key=value"},
+		{name: "conservative assignment", input: "password = get_password_from_vault()", want: "password = <redacted>"},
+		{name: "go short declaration", input: `password := "test"`, want: `password := "test"`},
+		{name: "url credentials", input: "DATABASE_URL=postgres://user:pass@host/db", want: "DATABASE_URL=postgres://<redacted>@host/db"},
+		{name: "url in short declaration", input: `databaseURL := "postgres://user:pass@host"`, want: `databaseURL := "postgres://<redacted>@host"`},
+		{name: "path at", input: "https://example.com/path@version", want: "https://example.com/path@version"},
+		{name: "query at", input: "https://example.com?email=user@example.com", want: "https://example.com?email=user@example.com"},
+		{name: "later url", input: `urls := "https://public.example postgres://user:pass@db/app"`, want: `urls := "https://public.example postgres://<redacted>@db/app"`},
+		{name: "missing host", input: "proto://user:pass@", want: "proto://user:pass@"},
+		{name: "missing user", input: "proto://:pass@host", want: "proto://:pass@host"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := redactSensitiveContent(test.input); got != test.want {
+				t.Fatalf("redactSensitiveContent() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestReadTextRedactsSensitiveContent(t *testing.T) {
+	service, root := testService(t)
+	const secret = "GRIN_TEST_SECRET_7F91C"
+	content := "PASSWORD=" + secret + "\nDATABASE_URL=postgres://user:urlsecret@host/db\nPORT=3306\n"
+	if err := os.WriteFile(filepath.Join(root, "secret.txt"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.ReadText(context.Background(), ReadInput{Path: "secret.txt"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Content, secret) || strings.Contains(result.Content, "urlsecret") {
+		t.Fatal("ReadText returned unredacted sensitive content")
+	}
+	if !strings.Contains(result.Content, "PASSWORD=<redacted>") || !strings.Contains(result.Content, "postgres://<redacted>@host/db") || !strings.Contains(result.Content, "PORT=3306") {
+		t.Fatalf("unexpected redacted content: %q", result.Content)
+	}
+	if result.Bytes != int64(len(content)) {
+		t.Fatalf("ReadText bytes = %d, want %d", result.Bytes, len(content))
+	}
 }
 
 func TestReadTextRejectsOutsideWorkspaceAndEnforcesLimit(t *testing.T) {
@@ -261,6 +320,12 @@ func TestYoloAllowsOutsideWorkspaceFilesystemOperations(t *testing.T) {
 	}
 	if enabled, ok := service.Info()["yolo"].(bool); !ok || !enabled {
 		t.Fatalf("workspace info yolo = %#v", service.Info()["yolo"])
+	}
+	if mode := service.Info()["mode"]; mode != "yolo" {
+		t.Fatalf("workspace info mode = %#v", mode)
+	}
+	if _, ok := service.Info()["read_only"]; ok {
+		t.Fatalf("workspace info still exposes removed read_only field: %#v", service.Info())
 	}
 	path := filepath.Join(outside, "note.txt")
 	if _, err := service.ReadText(context.Background(), ReadInput{Path: path}, false); err != nil {

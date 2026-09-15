@@ -12,7 +12,7 @@ func TestCLIIdentityAndInteractiveUsage(t *testing.T) {
 		t.Fatal("CLI version must be set")
 	}
 	usage := config.Usage()
-	for _, expected := range []string{"grin [--workspace PATH]", "searches upward for the nearest .grin/config.yaml", "--yolo", "--version", "--headless is not supported"} {
+	for _, expected := range []string{"grin [--workspace PATH]", "grin upgrade", "searches upward for the nearest .grin/config.yaml", "--yolo", "--version", "--headless is not supported"} {
 		if !strings.Contains(usage, expected) {
 			t.Fatalf("usage missing %q: %s", expected, usage)
 		}

@@ -19,7 +19,15 @@ func ContextWithShutdown(parent context.Context) (context.Context, context.Cance
 func (a *Application) Run(ctx context.Context) error {
 	subscription := a.bus.Subscribe()
 	reliableSubscription := a.bus.SubscribeReliable()
-	model := tui.NewModel(a.Config.Workspace.Root, a.Config.Policy.Profile, a.readiness, a.Config.Yolo)
+	workspaceLabel := a.Config.Workspace.Root
+	modeLabel := "normal"
+	if !a.Config.Yolo {
+		workspaceLabel = "multi-workspace"
+	}
+	if a.Config.Yolo {
+		modeLabel = "yolo"
+	}
+	model := tui.NewModel(workspaceLabel, modeLabel, a.readiness, a.Config.Yolo)
 	model.MaxEntries = a.Config.TUI.MaxEvents
 	model.Attach(subscription.Events)
 	model.AttachReliable(reliableSubscription.Events)

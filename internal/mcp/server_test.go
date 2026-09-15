@@ -3,21 +3,23 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"grin/internal/approval"
 	"grin/internal/config"
+	"grin/internal/errs"
 	"grin/internal/events"
 	"grin/internal/filesystem"
-	gringit "grin/internal/git"
 	"grin/internal/policy"
 	grinruntime "grin/internal/runtime"
 )
@@ -42,8 +44,315 @@ func TestServerInstructionsAreExposedDuringInitialization(t *testing.T) {
 	}
 }
 
+func TestNormalModeRequiresWorkspaceAndListsRegistry(t *testing.T) {
+	root := t.TempDir()
+	registerTestWorkspace(t, root)
+	cfg := config.Defaults()
+	cfg.Workspace.Root = root
+	files, err := filesystem.New(root, cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := events.New(10)
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus})))
+	defer httpServer.Close()
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	listed, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.list", Arguments: map[string]any{}})
+	if err != nil || listed.IsError {
+		t.Fatalf("workspace.list = %+v, err=%v", listed, err)
+	}
+	if !strings.Contains(listed.Content[0].(*sdk.TextContent).Text, root) {
+		t.Fatalf("workspace.list omitted %q: %+v", root, listed)
+	}
+	missing, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: map[string]any{"path": "README.md"}})
+	if err != nil || !missing.IsError || !strings.Contains(missing.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceRequired)) {
+		t.Fatalf("missing workspace result = %+v, err=%v", missing, err)
+	}
+	foundSelectionFailure := false
+	for _, event := range bus.Snapshot() {
+		if event.Tool == "fs.read_text" && event.Type == events.EventToolFailed && event.Summary == "workspace selection failed" && event.Workspace == "" {
+			foundSelectionFailure = true
+		}
+	}
+	if !foundSelectionFailure {
+		t.Fatal("missing workspace failure was not visible in the lifecycle events")
+	}
+	unknown, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: map[string]any{"workspace": filepath.Join(t.TempDir(), "not-registered"), "path": "README.md"}})
+	if err != nil || !unknown.IsError || !strings.Contains(unknown.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceNotFound)) {
+		t.Fatalf("unknown workspace result = %+v, err=%v", unknown, err)
+	}
+	relative, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: map[string]any{"workspace": "relative", "path": "README.md"}})
+	if err != nil || !relative.IsError || !strings.Contains(relative.Content[0].(*sdk.TextContent).Text, string(errs.ErrInvalidInput)) {
+		t.Fatalf("relative workspace result = %+v, err=%v", relative, err)
+	}
+	badList, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.list", Arguments: map[string]any{"extra": true}})
+	if err != nil || !badList.IsError || !strings.Contains(badList.Content[0].(*sdk.TextContent).Text, string(errs.ErrInvalidInput)) {
+		t.Fatalf("workspace.list unknown field result = %+v, err=%v", badList, err)
+	}
+	badInfo, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.info", Arguments: workspaceArgs(root, map[string]any{"extra": true})})
+	if err != nil || !badInfo.IsError || !strings.Contains(badInfo.Content[0].(*sdk.TextContent).Text, string(errs.ErrInvalidInput)) {
+		t.Fatalf("workspace.info unknown field result = %+v, err=%v", badInfo, err)
+	}
+}
+
+func TestNormalModeRoutesOneServerToTwoWorkspaces(t *testing.T) {
+	first := t.TempDir()
+	second := t.TempDir()
+	registerTestWorkspace(t, first)
+	if err := os.WriteFile(filepath.Join(first, "note.txt"), []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(second, "note.txt"), []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Workspace.Root = first
+	files, err := filesystem.New(first, cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := events.New(10)
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus})))
+	defer httpServer.Close()
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if _, err := config.RegisterWorkspace(second); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.list", Arguments: map[string]any{}})
+	if err != nil || listed.IsError || !strings.Contains(listed.Content[0].(*sdk.TextContent).Text, second) {
+		t.Fatalf("live workspace.list omitted newly registered workspace %q: %+v, err=%v", second, listed, err)
+	}
+	tests := []struct {
+		root string
+		want string
+	}{
+		{root: first, want: "first"},
+		{root: second, want: "second"},
+	}
+	results := make(chan struct {
+		root   string
+		want   string
+		result *sdk.CallToolResult
+		err    error
+	}, len(tests))
+	var wait sync.WaitGroup
+	for _, test := range tests {
+		test := test
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(test.root, map[string]any{"path": "note.txt"})})
+			results <- struct {
+				root   string
+				want   string
+				result *sdk.CallToolResult
+				err    error
+			}{test.root, test.want, result, err}
+		}()
+	}
+	wait.Wait()
+	close(results)
+	for result := range results {
+		if result.err != nil || result.result == nil || result.result.IsError || !strings.Contains(result.result.Content[0].(*sdk.TextContent).Text, result.want) {
+			t.Fatalf("workspace %q read = %+v, err=%v", result.root, result.result, result.err)
+		}
+	}
+	seen := map[string]bool{}
+	for _, event := range bus.Snapshot() {
+		if event.Tool == "fs.read_text" && event.Type == events.EventRequestStarted {
+			seen[event.Workspace] = true
+		}
+	}
+	firstCanonical, _ := filepath.EvalSymlinks(first)
+	secondCanonical, _ := filepath.EvalSymlinks(second)
+	if !seen[firstCanonical] || !seen[secondCanonical] {
+		t.Fatalf("request lifecycle workspaces = %v, want %q and %q", seen, firstCanonical, secondCanonical)
+	}
+}
+
+func TestSelectedWorkspaceConfigIsValidated(t *testing.T) {
+	root := t.TempDir()
+	registerTestWorkspace(t, root)
+	if err := os.MkdirAll(filepath.Join(root, ".grin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, config.WorkspaceConfigPath), []byte("version: 1\nlimits:\n  max_processes: -1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Workspace.Root = root
+	files, err := filesystem.New(root, cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: events.New(10)})))
+	defer httpServer.Close()
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(root, map[string]any{"path": "README.md"})})
+	if err != nil || !result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceUnavailable)) {
+		t.Fatalf("invalid selected config result = %+v, err=%v", result, err)
+	}
+}
+
+func TestWorkspaceInfoUsesSelectedWorkspace(t *testing.T) {
+	root := t.TempDir()
+	registerTestWorkspace(t, root)
+	cfg := config.Defaults()
+	cfg.Workspace.Root = root
+	files, err := filesystem.New(root, cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: events.New(10), Policy: policy.New()})))
+	defer httpServer.Close()
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.info", Arguments: workspaceArgs(root, map[string]any{})})
+	if err != nil || result == nil || result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, root) {
+		t.Fatalf("workspace.info result = %+v, err=%v", result, err)
+	}
+}
+
+func TestRegisteredWorkspaceSymlinkReplacementIsUnavailable(t *testing.T) {
+	root := t.TempDir()
+	registerTestWorkspace(t, root)
+	registered, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Workspace.Root = root
+	files, err := filesystem.New(root, cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: events.New(10)})))
+	defer httpServer.Close()
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	moved := filepath.Join(t.TempDir(), "moved")
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, root); err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: map[string]any{"workspace": registered, "path": "missing.txt"}})
+	if err != nil || !result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceUnavailable)) {
+		t.Fatalf("replaced workspace result = %+v, err=%v", result, err)
+	}
+}
+
+func TestStreamableHTTPReadTextRedactsSensitiveContent(t *testing.T) {
+	root := t.TempDir()
+	registerTestWorkspace(t, root)
+	const secret = "GRIN_TEST_SECRET_7F91C"
+	content := "PASSWORD=" + secret + "\nPORT=3306\n"
+	if err := os.WriteFile(filepath.Join(root, "secret.txt"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Defaults()
+	cfg.Workspace.Root = root
+	files, err := filesystem.New(root, cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := events.New(10)
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{
+		Filesystem: files,
+		Config:     cfg,
+		Version:    "test",
+		Events:     bus,
+		Policy:     policy.New(false),
+	})))
+	defer httpServer.Close()
+
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{
+		Endpoint:             httpServer.URL,
+		HTTPClient:           httpServer.Client(),
+		MaxRetries:           -1,
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name: "fs.read_text",
+		Arguments: workspaceArgs(root, map[string]any{
+			"path": "secret.txt",
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || len(result.Content) == 0 {
+		t.Fatalf("unexpected fs.read_text result: %+v", result)
+	}
+
+	text := result.Content[0].(*sdk.TextContent).Text
+	if strings.Contains(text, secret) {
+		t.Fatal("TextContent leaked the sensitive sentinel")
+	}
+	var decoded filesystem.ReadOutput
+	if err := json.Unmarshal([]byte(text), &decoded); err != nil {
+		t.Fatalf("decode TextContent: %v", err)
+	}
+	if !strings.Contains(decoded.Content, "<redacted>") || !strings.Contains(decoded.Content, "PORT=3306") {
+		t.Fatalf("unexpected decoded content: %q", decoded.Content)
+	}
+
+	structured, ok := result.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent type = %T, want map[string]any", result.StructuredContent)
+	}
+	structuredContent, ok := structured["content"].(string)
+	if !ok {
+		t.Fatalf("StructuredContent content type = %T, want string", structured["content"])
+	}
+	if strings.Contains(structuredContent, secret) {
+		t.Fatal("StructuredContent leaked the sensitive sentinel")
+	}
+	if !strings.Contains(structuredContent, "<redacted>") || !strings.Contains(structuredContent, "PORT=3306") {
+		t.Fatalf("unexpected structured content: %q", structuredContent)
+	}
+	for _, event := range bus.Snapshot() {
+		if strings.Contains(event.Summary, secret) || strings.Contains(event.Detail, secret) {
+			t.Fatalf("lifecycle event leaked the sensitive sentinel: %+v", event)
+		}
+	}
+}
+
 func TestStreamableHTTPReadWorkflow(t *testing.T) {
 	root := t.TempDir()
+	registerTestWorkspace(t, root)
 	if err := os.WriteFile(root+"/note.txt", []byte("hello"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +371,7 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 	subscription := bus.Subscribe()
 	defer subscription.Close()
 	manager := approval.New(bus, time.Second)
-	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New("workspace", cfg.Yolo)})))
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New(cfg.Yolo)})))
 	defer httpServer.Close()
 
 	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
@@ -75,10 +384,10 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 15 {
-		t.Fatalf("expected fifteen V1 tools, got %d", len(tools.Tools))
+	if len(tools.Tools) != 16 {
+		t.Fatalf("expected sixteen normal-mode tools, got %d", len(tools.Tools))
 	}
-	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: map[string]any{"path": "note.txt"}})
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(root, map[string]any{"path": "note.txt"})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +407,7 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 			t.Fatalf("timed out waiting for %s", want)
 		}
 	}
-	outsideResult, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: map[string]any{"path": outsideNote}})
+	outsideResult, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(root, map[string]any{"path": outsideNote})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +421,7 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 		}
 	}
 
-	missingRead, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: map[string]any{"path": filepath.Join(outside, "missing.txt")}})
+	missingRead, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(root, map[string]any{"path": filepath.Join(outside, "missing.txt")})})
 	if err != nil || !missingRead.IsError {
 		t.Fatalf("missing outside read = %+v, err=%v", missingRead, err)
 	}
@@ -122,7 +431,7 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 			t.Fatalf("missing outside read event type = %s, want %s", event.Type, want)
 		}
 	}
-	searchResult, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.search", Arguments: map[string]any{"query": "hello"}})
+	searchResult, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.search", Arguments: workspaceArgs(root, map[string]any{"query": "hello"})})
 	if err != nil || searchResult.IsError {
 		t.Fatalf("search result = %+v, err=%v", searchResult, err)
 	}
@@ -139,7 +448,7 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 			t.Fatalf("timed out waiting for search %s", want)
 		}
 	}
-	failedSearch, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.search", Arguments: map[string]any{"query": "hello", "path": filepath.Join(outside, "missing-dir")}})
+	failedSearch, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.search", Arguments: workspaceArgs(root, map[string]any{"query": "hello", "path": filepath.Join(outside, "missing-dir")})})
 	if err != nil || !failedSearch.IsError {
 		t.Fatalf("failed search result = %+v, err=%v", failedSearch, err)
 	}
@@ -160,6 +469,7 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 
 func TestStreamableHTTPWorkspaceAllowsAllOutsideReads(t *testing.T) {
 	root := t.TempDir()
+	registerTestWorkspace(t, root)
 	outside := t.TempDir()
 	note := filepath.Join(outside, "note.txt")
 	if err := os.WriteFile(note, []byte("outside"), 0o600); err != nil {
@@ -173,7 +483,7 @@ func TestStreamableHTTPWorkspaceAllowsAllOutsideReads(t *testing.T) {
 	}
 	bus := events.New(20)
 	manager := approval.New(bus, time.Second)
-	server := NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New("workspace")})
+	server := NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New()})
 	httpServer := httptest.NewServer(Handler(server))
 	defer httpServer.Close()
 	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
@@ -192,7 +502,7 @@ func TestStreamableHTTPWorkspaceAllowsAllOutsideReads(t *testing.T) {
 		{name: "fs.read_text", args: map[string]any{"path": note}},
 		{name: "fs.search", args: map[string]any{"path": outside, "query": "outside"}},
 	} {
-		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: call.name, Arguments: call.args})
+		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: call.name, Arguments: workspaceArgs(root, call.args)})
 		if callErr != nil || result.IsError {
 			t.Fatalf("workspace outside %s = %+v, err=%v", call.name, result, callErr)
 		}
@@ -201,65 +511,6 @@ func TestStreamableHTTPWorkspaceAllowsAllOutsideReads(t *testing.T) {
 		if event.Type == events.EventApprovalRequired {
 			t.Fatal("workspace outside read unexpectedly required approval")
 		}
-	}
-}
-
-func TestStreamableHTTPRestrictedProfilesDenyOutsideOperations(t *testing.T) {
-	for _, profile := range []string{"read-only", "restricted"} {
-		t.Run(profile, func(t *testing.T) {
-			root := t.TempDir()
-			outside := t.TempDir()
-			note := filepath.Join(outside, "note.txt")
-			if err := os.WriteFile(note, []byte("outside"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			cfg := config.Defaults()
-			cfg.Workspace.Root = root
-			cfg.Policy.Profile = profile
-			files, err := filesystem.New(root, cfg.Limits)
-			if err != nil {
-				t.Fatal(err)
-			}
-			runtimeService, err := grinruntime.New(cfg, files.Root())
-			if err != nil {
-				t.Fatal(err)
-			}
-			bus := events.New(30)
-			manager := approval.New(bus, time.Second)
-			httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New(profile)})))
-			defer httpServer.Close()
-			client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
-			session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer session.Close()
-
-			for _, call := range []struct {
-				name string
-				args map[string]any
-			}{
-				{name: "fs.list", args: map[string]any{"path": outside}},
-				{name: "fs.stat", args: map[string]any{"path": note}},
-				{name: "fs.read_text", args: map[string]any{"path": note}},
-				{name: "fs.search", args: map[string]any{"path": outside, "query": "outside"}},
-				{name: "fs.write_text", args: map[string]any{"path": filepath.Join(outside, "new.txt"), "content": "blocked"}},
-				{name: "shell.run", args: map[string]any{"command": "pwd", "cwd": outside}},
-			} {
-				result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: call.name, Arguments: call.args})
-				if callErr != nil || result == nil || !result.IsError {
-					t.Fatalf("%s outside operation was not denied: %+v, err=%v", call.name, result, callErr)
-				}
-			}
-			for _, event := range bus.Snapshot() {
-				if event.Type == events.EventApprovalRequired {
-					t.Fatal("outside operation unexpectedly requested approval")
-				}
-			}
-			if _, err := os.Stat(filepath.Join(outside, "new.txt")); !os.IsNotExist(err) {
-				t.Fatalf("denied outside write created a file, stat error=%v", err)
-			}
-		})
 	}
 }
 
@@ -280,85 +531,9 @@ func TestSearchSummary(t *testing.T) {
 	}
 }
 
-func TestStreamableHTTPWriteRequiresMatchingApproval(t *testing.T) {
-	root := t.TempDir()
-	cfg := config.Defaults()
-	cfg.Policy.Profile = "restricted"
-	files, err := filesystem.New(root, cfg.Limits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bus := events.New(10)
-	reliable := bus.SubscribeReliable()
-	defer reliable.Close()
-	manager := approval.New(bus, time.Second)
-	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New("restricted", cfg.Yolo)})))
-	defer httpServer.Close()
-
-	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
-	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-
-	call := make(chan *sdk.CallToolResult, 1)
-	callErr := make(chan error, 1)
-	go func() {
-		result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: map[string]any{"path": "approved.txt", "content": "approved"}})
-		call <- result
-		callErr <- err
-	}()
-	event := waitForApprovalEvent(t, reliable.Events)
-	if event.ToolCallID == "" || event.ApprovalRequestID == "" || event.OperationDigest == "" {
-		t.Fatalf("approval event missing identity: %+v", event)
-	}
-	if strings.Contains(event.Detail, "timeout_ms") || strings.Contains(event.Detail, "bytes=") || !strings.Contains(event.Detail, "reason:") {
-		t.Fatalf("approval detail has the wrong display scope: %q", event.Detail)
-	}
-	if err := manager.Resolve(approval.ApprovalDecision{ApprovalRequestID: event.ApprovalRequestID, OperationDigest: event.OperationDigest, Outcome: events.ApprovalAllowed}); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-callErr; err != nil {
-		t.Fatal(err)
-	}
-	if result := <-call; result.IsError {
-		t.Fatalf("approved write returned error: %+v", result)
-	}
-	data, err := os.ReadFile(root + "/approved.txt")
-	if err != nil || string(data) != "approved" {
-		t.Fatalf("approved file = %q, err=%v", data, err)
-	}
-
-	call = make(chan *sdk.CallToolResult, 1)
-	callErr = make(chan error, 1)
-	go func() {
-		result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: map[string]any{"path": "rejected.txt", "content": "rejected"}})
-		call <- result
-		callErr <- err
-	}()
-	event = waitForApprovalEvent(t, reliable.Events)
-	if err := manager.Resolve(approval.ApprovalDecision{ApprovalRequestID: event.ApprovalRequestID, OperationDigest: event.OperationDigest, Outcome: events.ApprovalRejected}); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-callErr; err != nil {
-		t.Fatal(err)
-	}
-	if result := <-call; !result.IsError {
-		t.Fatal("rejected write returned success")
-	}
-	if _, err := os.Stat(root + "/rejected.txt"); !os.IsNotExist(err) {
-		t.Fatalf("rejected file exists or returned unexpected error: %v", err)
-	}
-	for _, event := range bus.Snapshot() {
-		if event.Type == events.EventToolFailed {
-			t.Fatalf("approval rejection emitted tool_failed: %+v", event)
-		}
-	}
-}
-
 func TestStreamableHTTPWorkspaceWriteSkipsApproval(t *testing.T) {
 	root := t.TempDir()
+	registerTestWorkspace(t, root)
 	cfg := config.Defaults()
 	files, err := filesystem.New(root, cfg.Limits, cfg.Yolo)
 	if err != nil {
@@ -366,7 +541,7 @@ func TestStreamableHTTPWorkspaceWriteSkipsApproval(t *testing.T) {
 	}
 	bus := events.New(10)
 	manager := approval.New(bus, time.Second)
-	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New("workspace", cfg.Yolo)})))
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New(cfg.Yolo)})))
 	defer httpServer.Close()
 
 	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
@@ -376,7 +551,7 @@ func TestStreamableHTTPWorkspaceWriteSkipsApproval(t *testing.T) {
 	}
 	defer session.Close()
 
-	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: map[string]any{"path": "workspace.txt", "content": "ok"}})
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: workspaceArgs(root, map[string]any{"path": "workspace.txt", "content": "ok"})})
 	if err != nil || result.IsError {
 		t.Fatalf("workspace write result = %+v, err=%v", result, err)
 	}
@@ -393,6 +568,7 @@ func TestStreamableHTTPWorkspaceWriteSkipsApproval(t *testing.T) {
 
 func TestStreamableHTTPWorkspaceOutsideWriteRequiresApproval(t *testing.T) {
 	root := t.TempDir()
+	registerTestWorkspace(t, root)
 	outside := t.TempDir()
 	cfg := config.Defaults()
 	cfg.Workspace.Root = root
@@ -404,7 +580,7 @@ func TestStreamableHTTPWorkspaceOutsideWriteRequiresApproval(t *testing.T) {
 	reliable := bus.SubscribeReliable()
 	defer reliable.Close()
 	manager := approval.New(bus, time.Second)
-	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New("workspace", cfg.Yolo)})))
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New(cfg.Yolo)})))
 	defer httpServer.Close()
 
 	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
@@ -421,7 +597,7 @@ func TestStreamableHTTPWorkspaceOutsideWriteRequiresApproval(t *testing.T) {
 	call := func(path, content string) (<-chan callResult, events.Event) {
 		results := make(chan callResult, 1)
 		go func() {
-			result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: map[string]any{"path": path, "content": content}})
+			result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: workspaceArgs(root, map[string]any{"path": path, "content": content})})
 			results <- callResult{result: result, err: callErr}
 		}()
 		return results, waitForApprovalEvent(t, reliable.Events)
@@ -463,6 +639,7 @@ func TestStreamableHTTPWorkspaceOutsideWriteRequiresApproval(t *testing.T) {
 
 func TestStreamableHTTPShellOutsideCwdRequiresApproval(t *testing.T) {
 	root := t.TempDir()
+	registerTestWorkspace(t, root)
 	cfg := config.Defaults()
 	cfg.Workspace.Root = root
 	files, err := filesystem.New(root, cfg.Limits, cfg.Yolo)
@@ -477,7 +654,7 @@ func TestStreamableHTTPShellOutsideCwdRequiresApproval(t *testing.T) {
 	reliable := bus.SubscribeReliable()
 	defer reliable.Close()
 	manager := approval.New(bus, time.Second)
-	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New("workspace", cfg.Yolo)})))
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New(cfg.Yolo)})))
 	defer httpServer.Close()
 
 	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
@@ -494,7 +671,7 @@ func TestStreamableHTTPShellOutsideCwdRequiresApproval(t *testing.T) {
 	outside := filepath.Dir(root)
 	results := make(chan callResult, 1)
 	go func() {
-		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: map[string]any{"command": "pwd", "cwd": outside}})
+		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: workspaceArgs(root, map[string]any{"command": "pwd", "cwd": outside})})
 		results <- callResult{result: result, err: callErr}
 	}()
 	event := waitForApprovalEvent(t, reliable.Events)
@@ -516,7 +693,7 @@ func TestStreamableHTTPShellOutsideCwdRequiresApproval(t *testing.T) {
 
 	results = make(chan callResult, 1)
 	go func() {
-		value, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: map[string]any{"command": "pwd", "cwd": outside}})
+		value, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: workspaceArgs(root, map[string]any{"command": "pwd", "cwd": outside})})
 		results <- callResult{result: value, err: callErr}
 	}()
 	event = waitForApprovalEvent(t, reliable.Events)
@@ -532,8 +709,86 @@ func TestStreamableHTTPShellOutsideCwdRequiresApproval(t *testing.T) {
 	}
 }
 
+func TestStreamableHTTPShellDisplayRedactsEnvironmentAssignments(t *testing.T) {
+	root := t.TempDir()
+	registerTestWorkspace(t, root)
+	cfg := config.Defaults()
+	cfg.Workspace.Root = root
+	files, err := filesystem.New(root, cfg.Limits, cfg.Yolo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeService, err := grinruntime.New(cfg, files.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := events.New(10)
+	reliable := bus.SubscribeReliable()
+	defer reliable.Close()
+	manager := approval.New(bus, time.Second)
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New(cfg.Yolo)})))
+	defer httpServer.Close()
+
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	type callResult struct {
+		result *sdk.CallToolResult
+		err    error
+	}
+	results := make(chan callResult, 1)
+	outside := filepath.Dir(root)
+	go func() {
+		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: workspaceArgs(root, map[string]any{
+			"command": "env",
+			"args":    []string{"HOME=/Users/example", "GOPATH=/Users/example/go", "sh", "-c", "exit 0"},
+			"cwd":     outside,
+		})})
+		results <- callResult{result: result, err: callErr}
+	}()
+
+	event := waitForApprovalEvent(t, reliable.Events)
+	if strings.Contains(event.Summary+event.Detail, "/Users/example") {
+		t.Fatalf("approval event leaked environment value: %+v", event)
+	}
+	if !strings.Contains(event.Summary+event.Detail, "HOME=<redacted>") || !strings.Contains(event.Summary+event.Detail, "GOPATH=<redacted>") {
+		t.Fatalf("approval event omitted redacted environment names: %+v", event)
+	}
+	if err := manager.Resolve(approval.ApprovalDecision{ApprovalRequestID: event.ApprovalRequestID, OperationDigest: event.OperationDigest, Outcome: events.ApprovalAllowed}); err != nil {
+		t.Fatal(err)
+	}
+	result := <-results
+	if result.err != nil || result.result == nil || result.result.IsError {
+		t.Fatalf("approved shell result = %+v, err=%v", result.result, result.err)
+	}
+
+	foundCompletion := false
+	for _, lifecycle := range bus.Snapshot() {
+		if lifecycle.Tool != "shell.run" {
+			continue
+		}
+		if strings.Contains(lifecycle.Summary+lifecycle.Detail, "/Users/example") {
+			t.Fatalf("lifecycle event leaked environment value: %+v", lifecycle)
+		}
+		if lifecycle.Type == events.EventToolCompleted {
+			foundCompletion = true
+			if !strings.Contains(lifecycle.Summary, "HOME=<redacted>") || !strings.Contains(lifecycle.Summary, "GOPATH=<redacted>") {
+				t.Fatalf("completion omitted redacted environment names: %+v", lifecycle)
+			}
+		}
+	}
+	if !foundCompletion {
+		t.Fatal("shell completion event was not published")
+	}
+}
+
 func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 	root := t.TempDir()
+	registerTestWorkspace(t, root)
 	outside := t.TempDir()
 	if err := os.WriteFile(filepath.Join(outside, "note.txt"), []byte("outside"), 0o600); err != nil {
 		t.Fatal(err)
@@ -551,7 +806,7 @@ func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 	}
 	bus := events.New(20)
 	manager := approval.New(bus, time.Second)
-	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New("workspace", cfg.Yolo)})))
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New(cfg.Yolo)})))
 	defer httpServer.Close()
 
 	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
@@ -560,6 +815,16 @@ func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
+
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range tools.Tools {
+		if tool.Name == "workspace.list" {
+			t.Fatal("YOLO unexpectedly registered workspace.list")
+		}
+	}
 
 	infoResult, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.info", Arguments: map[string]any{}})
 	if err != nil || infoResult.IsError {
@@ -596,6 +861,7 @@ func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 
 func TestStreamableHTTPExecutionAndInspectionContracts(t *testing.T) {
 	root := t.TempDir()
+	registerTestWorkspace(t, root)
 	cfg := config.Defaults()
 	cfg.Workspace.Root = root
 	files, err := filesystem.New(root, cfg.Limits)
@@ -607,7 +873,7 @@ func TestStreamableHTTPExecutionAndInspectionContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 	bus := events.New(20)
-	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Policy: policy.New("workspace")})))
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Policy: policy.New()})))
 	defer httpServer.Close()
 
 	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
@@ -619,9 +885,9 @@ func TestStreamableHTTPExecutionAndInspectionContracts(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "edit.txt"), []byte("before"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	edited, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.edit_text", Arguments: map[string]any{
+	edited, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.edit_text", Arguments: workspaceArgs(root, map[string]any{
 		"path": "edit.txt", "old_text": "before", "new_text": "after",
-	}})
+	})})
 	if callErr != nil || edited == nil || edited.IsError {
 		t.Fatalf("fs.edit_text result = %+v, err=%v", edited, callErr)
 	}
@@ -630,9 +896,9 @@ func TestStreamableHTTPExecutionAndInspectionContracts(t *testing.T) {
 		t.Fatalf("edited file = %q, err=%v", data, err)
 	}
 
-	completed, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: map[string]any{
+	completed, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: workspaceArgs(root, map[string]any{
 		"command": "echo", "args": []string{"--token", "not-for-display"}, "timeout_ms": 5000,
-	}})
+	})})
 	if callErr != nil || completed == nil || completed.IsError {
 		t.Fatalf("normal shell result = %+v, err=%v", completed, callErr)
 	}
@@ -680,56 +946,6 @@ func TestStreamableHTTPExecutionAndInspectionContracts(t *testing.T) {
 		if completion.Summary != call.wantSummary {
 			t.Fatalf("%s completion summary = %q, want %q", call.name, completion.Summary, call.wantSummary)
 		}
-	}
-}
-
-func TestGitApprovalPrecedesRepositoryValidation(t *testing.T) {
-	root := t.TempDir()
-	cfg := config.Defaults()
-	cfg.Workspace.Root = root
-	files, err := filesystem.New(root, cfg.Limits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtimeService, err := grinruntime.New(cfg, files.Root())
-	if err != nil {
-		t.Fatal(err)
-	}
-	bus := events.New(20)
-	reliable := bus.SubscribeReliable()
-	defer reliable.Close()
-	manager := approval.New(bus, time.Second)
-	server := NewServer(Dependencies{
-		Filesystem: files,
-		Runtime:    runtimeService,
-		Git:        gringit.New(runtimeService, files.Root()),
-		Config:     cfg,
-		Version:    "test",
-		Events:     bus,
-		Approval:   manager,
-		Policy:     policy.New("restricted"),
-	})
-	httpServer := httptest.NewServer(Handler(server))
-	defer httpServer.Close()
-	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
-	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-
-	resultCh := make(chan *sdk.CallToolResult, 1)
-	go func() {
-		result, _ := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "git.status", Arguments: map[string]any{}})
-		resultCh <- result
-	}()
-	event := waitForApprovalEvent(t, reliable.Events)
-	if err := manager.Resolve(approval.ApprovalDecision{ApprovalRequestID: event.ApprovalRequestID, OperationDigest: event.OperationDigest, Outcome: events.ApprovalRejected}); err != nil {
-		t.Fatal(err)
-	}
-	result := <-resultCh
-	if result == nil || !result.IsError || len(result.Content) == 0 || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, "approval_rejected") {
-		t.Fatalf("rejected Git approval result = %+v", result)
 	}
 }
 
@@ -790,4 +1006,30 @@ func newTestHTTPServer(t *testing.T) *httptest.Server {
 		t.Fatal(err)
 	}
 	return httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Config: cfg, Version: "test", Events: events.New(10)})))
+}
+
+func registerTestWorkspace(t *testing.T, root string) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	if _, err := config.RegisterWorkspace(root); err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := config.LoadRegistry()
+	canonical, canonicalErr := filepath.EvalSymlinks(root)
+	if err != nil || canonicalErr != nil || len(workspaces) != 1 || workspaces[0] != canonical {
+		t.Fatalf("registered workspaces = %v, err=%v, want %s", workspaces, err, root)
+	}
+}
+
+func workspaceArgs(root string, args map[string]any) map[string]any {
+	result := make(map[string]any, len(args)+1)
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		canonical = root
+	}
+	result["workspace"] = canonical
+	for key, value := range args {
+		result[key] = value
+	}
+	return result
 }
