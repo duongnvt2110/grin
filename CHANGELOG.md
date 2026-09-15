@@ -4,8 +4,25 @@ All notable Grin changes are documented here.
 
 ## Unreleased
 
-- Separate commit verification from tag-based release publishing.
-- Keep GitHub release notes and the project changelog in sync.
+No unreleased changes yet.
+
+## 0.2.0 - 2026-09-15
+
+### Added
+
+- Multi-workspace MCP routing through one Grin connector and tunnel.
+- Workspace registration with `grin init` and `.grin/config.yaml`.
+- TUI transcript rows with inline approval actions and workspace context.
+- `grin upgrade` for updating an installed binary from GitHub Releases.
+- macOS and Linux release archives with checksums and installer documentation.
+
+### Improved
+
+- Added filesystem, Git, shell, process, and system tool coverage for routed
+  workspaces.
+- Added workspace-aware policy, approval, environment filtering, output limits,
+  and sensitive display redaction.
+- Added CI verification and tag-triggered GoReleaser publishing.
 
 ## 0.1.0 - 2026-09-10
 
