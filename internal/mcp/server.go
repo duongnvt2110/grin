@@ -69,7 +69,7 @@ func NewServer(deps Dependencies) *sdk.Server {
 		Instructions: serverInstructions,
 		Capabilities: &sdk.ServerCapabilities{},
 	})
-	addTool(server, deps, true, "workspace.info", "Return the selected Grin workspace.", map[string]any{"type": "object", "additionalProperties": false}, func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
+	addTool(server, deps, true, "workspace.info", "Return metadata for the selected workspace. In normal mode, provide the exact workspace argument. This is not a discovery or selection tool; use workspace.list when the workspace path is unknown.", map[string]any{"type": "object", "additionalProperties": false}, func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
 		var input emptyInput
 		if err := decode(raw, &input); err != nil {
 			return nil, errs.New(errs.ErrInvalidInput, "invalid workspace.info arguments", false)
@@ -80,7 +80,7 @@ func NewServer(deps Dependencies) *sdk.Server {
 		return toolResult{Value: deps.Filesystem.Info(), Summary: "selected workspace"}, nil
 	})
 	if !deps.Config.Yolo {
-		addTool(server, deps, false, "workspace.list", "List registered Grin workspaces.", objectSchema(map[string]any{}), func(_ context.Context, _ Dependencies, _ string, raw json.RawMessage) (any, error) {
+		addTool(server, deps, false, "workspace.list", "Discover registered Grin workspaces. In normal mode, call this before any workspace-scoped tool when the user has not provided an exact absolute workspace path. If multiple workspaces are returned, ask the user to choose; never guess.", objectSchema(map[string]any{}), func(_ context.Context, _ Dependencies, _ string, raw json.RawMessage) (any, error) {
 			var input emptyInput
 			if err := decode(raw, &input); err != nil {
 				return nil, errs.New(errs.ErrInvalidInput, "invalid workspace.list arguments", false)

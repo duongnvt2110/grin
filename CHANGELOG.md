@@ -6,6 +6,15 @@ All notable Grin changes are documented here.
 
 No unreleased changes yet.
 
+## 0.2.1 - 2026-09-15
+
+### Fixed
+
+- Clarifies normal-mode workspace discovery: `workspace.list` is used before
+  scoped tools when no exact workspace path is known.
+- Clarifies that `workspace.info` reports an already selected workspace and is
+  not a discovery or selection tool.
+
 ## 0.2.0 - 2026-09-15
 
 ### Added
