@@ -52,6 +52,7 @@ func TestSecurityHelperProcess(t *testing.T) {
 
 func TestSecurityMCPDestructiveApprovalCannotBeBypassed(t *testing.T) {
 	root := t.TempDir()
+	registerSecurityWorkspace(t, root)
 	cfg := config.Defaults()
 	cfg.Workspace.Root = root
 	files, err := filesystem.New(root, cfg.Limits)
@@ -66,7 +67,7 @@ func TestSecurityMCPDestructiveApprovalCannotBeBypassed(t *testing.T) {
 	reliable := bus.SubscribeReliable()
 	defer reliable.Close()
 	manager := approval.New(bus, time.Second)
-	server := mcp.NewServer(mcp.Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New("workspace")})
+	server := mcp.NewServer(mcp.Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New()})
 	httpServer := httptest.NewServer(mcp.Handler(server))
 	defer httpServer.Close()
 	client := sdk.NewClient(&sdk.Implementation{Name: "security-test", Version: "test"}, nil)
@@ -87,10 +88,10 @@ func TestSecurityMCPDestructiveApprovalCannotBeBypassed(t *testing.T) {
 	}
 	results := make(chan callResult, 1)
 	go func() {
-		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: map[string]any{
+		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: securityWorkspaceArgs(root, map[string]any{
 			"command": "/bin/rm",
 			"args":    []string{target},
-		}})
+		})})
 		results <- callResult{result: result, err: callErr}
 	}()
 	event := waitForApproval(t, reliable.Events)
@@ -114,10 +115,10 @@ func TestSecurityMCPDestructiveApprovalCannotBeBypassed(t *testing.T) {
 	}
 	results = make(chan callResult, 1)
 	go func() {
-		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: map[string]any{
+		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell.run", Arguments: securityWorkspaceArgs(root, map[string]any{
 			"command": "/bin/rm",
 			"args":    []string{approvedTarget},
-		}})
+		})})
 		results <- callResult{result: result, err: callErr}
 	}()
 	event = waitForApproval(t, reliable.Events)
@@ -164,6 +165,7 @@ func TestSecurityWorkspaceAndLoopbackBoundaries(t *testing.T) {
 
 func TestSecurityMCPRejectsUnknownFields(t *testing.T) {
 	root := t.TempDir()
+	registerSecurityWorkspace(t, root)
 	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte("safe"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +184,7 @@ func TestSecurityMCPRejectsUnknownFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
-	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: map[string]any{"path": "note.txt", "extra": true}})
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: securityWorkspaceArgs(root, map[string]any{"path": "note.txt", "extra": true})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,4 +247,25 @@ func waitForApproval(t *testing.T, stream <-chan events.Event) events.Event {
 			t.Fatal("timed out waiting for approval")
 		}
 	}
+}
+
+func registerSecurityWorkspace(t *testing.T, root string) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	if _, err := config.RegisterWorkspace(root); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func securityWorkspaceArgs(root string, args map[string]any) map[string]any {
+	result := make(map[string]any, len(args)+1)
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		canonical = root
+	}
+	result["workspace"] = canonical
+	for key, value := range args {
+		result[key] = value
+	}
+	return result
 }

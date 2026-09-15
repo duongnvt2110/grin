@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -102,6 +103,23 @@ type SearchOutput struct {
 
 var errSearchComplete = errors.New("search result limit reached")
 
+var readAssignmentPattern = regexp.MustCompile(`^(\s*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?\s*)([:=])(\s*)(.*)$`)
+var readURLCredentialPattern = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)([A-Za-z0-9._~%+-]+):([A-Za-z0-9._~%:+-]+)@([A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]+\])`)
+
+var readSensitiveNames = []string{
+	"password", "passwd", "pwd", "secret", "token",
+	"credential", "credentials", "creds", "authorization",
+}
+
+var readSensitiveCompoundSuffixes = []string{
+	"apikey", "authkey", "accesskey", "accesskeyid", "secretkey", "secretaccesskey",
+	"privatekey", "servicekey", "accountkey", "clientkey", "dbkey", "databasekey",
+	"clientsecret", "consumersecret", "jwtsecret",
+	"accesstoken", "refreshtoken", "authtoken", "apitoken", "jwttoken",
+	"dbpassword", "databasepassword", "dbpasswd", "databasepasswd",
+	"dbpwd", "databasepwd", "dbpass", "databasepass",
+}
+
 func New(root string, limits config.Limits, yoloFlag ...bool) (*Service, error) {
 	yolo := len(yoloFlag) > 0 && yoloFlag[0]
 	absolute, err := filepath.Abs(root)
@@ -122,7 +140,11 @@ func New(root string, limits config.Limits, yoloFlag ...bool) (*Service, error) 
 func (s *Service) Root() string { return s.root }
 
 func (s *Service) Info() map[string]any {
-	return map[string]any{"root": s.root, "read_only": false, "profile": "workspace", "yolo": s.yolo}
+	mode := "normal"
+	if s.yolo {
+		mode = "yolo"
+	}
+	return map[string]any{"root": s.root, "mode": mode, "yolo": s.yolo}
 }
 
 func (s *Service) List(ctx context.Context, input ListInput, allowOutside bool) (ListOutput, error) {
@@ -232,7 +254,79 @@ func (s *Service) ReadText(_ context.Context, input ReadInput, allowOutside bool
 	if !utf8.Valid(data) || strings.IndexByte(string(data), 0) >= 0 {
 		return ReadOutput{}, errs.New(errs.ErrInvalidInput, "file is not valid text", false)
 	}
-	return ReadOutput{Path: s.relative(path), Content: string(data), Bytes: int64(len(data))}, nil
+	content := redactSensitiveContent(string(data))
+	return ReadOutput{Path: s.relative(path), Content: content, Bytes: int64(len(data))}, nil
+}
+
+func redactSensitiveContent(content string) string {
+	var result strings.Builder
+	result.Grow(len(content))
+	for _, line := range strings.SplitAfter(content, "\n") {
+		body := line
+		terminator := ""
+		if strings.HasSuffix(body, "\n") {
+			body = strings.TrimSuffix(body, "\n")
+			terminator = "\n"
+			if strings.HasSuffix(body, "\r") {
+				body = strings.TrimSuffix(body, "\r")
+				terminator = "\r\n"
+			}
+		}
+
+		replacedAssignment := false
+		if match := readAssignmentPattern.FindStringSubmatch(body); match != nil {
+			shortDeclaration := match[3] == ":" && match[4] == "" && strings.HasPrefix(match[5], "=")
+			if !shortDeclaration && sensitiveReadName(match[2]) {
+				body = match[1] + match[3] + match[4] + redactSensitiveValue(match[5])
+				replacedAssignment = true
+			}
+		}
+		if !replacedAssignment {
+			if redacted, ok := redactURLCredentials(body); ok {
+				body = redacted
+			}
+		}
+		result.WriteString(body)
+		result.WriteString(terminator)
+	}
+	return result.String()
+}
+
+func sensitiveReadName(name string) bool {
+	lower := strings.ToLower(name)
+	for _, candidate := range readSensitiveNames {
+		if lower == candidate || strings.HasSuffix(lower, "_"+candidate) || strings.HasSuffix(lower, "-"+candidate) || strings.HasSuffix(lower, "."+candidate) {
+			return true
+		}
+	}
+	normalized := strings.NewReplacer("_", "", "-", "", ".", "").Replace(lower)
+	for _, suffix := range readSensitiveCompoundSuffixes {
+		if strings.HasSuffix(normalized, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactSensitiveValue(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	comma := ""
+	if strings.HasSuffix(trimmed, ",") {
+		trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, ","))
+		comma = ","
+	}
+	if len(trimmed) >= 2 && (trimmed[0] == '"' || trimmed[0] == '\'') && trimmed[len(trimmed)-1] == trimmed[0] {
+		quote := string(trimmed[0])
+		return quote + "<redacted>" + quote + comma
+	}
+	return "<redacted>"
+}
+
+func redactURLCredentials(value string) (string, bool) {
+	if !readURLCredentialPattern.MatchString(value) {
+		return value, false
+	}
+	return readURLCredentialPattern.ReplaceAllString(value, `${1}<redacted>@${4}`), true
 }
 
 func (s *Service) ValidateWrite(input WriteInput) error {

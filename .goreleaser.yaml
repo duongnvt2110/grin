@@ -3,6 +3,8 @@ version: 2
 builds:
   - main: ./cmd/grin
     binary: grin
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
     goos:
       - darwin
       - linux

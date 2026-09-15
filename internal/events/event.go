@@ -56,6 +56,7 @@ type Event struct {
 	ApprovalRequestID string          `json:"approval_request_id,omitempty"`
 	OperationDigest   string          `json:"operation_digest,omitempty"`
 	ApprovalOutcome   ApprovalOutcome `json:"approval_outcome,omitempty"`
+	Workspace         string          `json:"workspace,omitempty"`
 	Risk              string          `json:"risk,omitempty"`
 	Type              EventType       `json:"type"`
 	Tool              string          `json:"tool,omitempty"`

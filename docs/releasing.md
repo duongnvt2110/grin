@@ -86,10 +86,25 @@ curl -fsSL https://raw.githubusercontent.com/duongnvt2110/grin/main/scripts/inst
 "$INSTALL_DIR/grin" --version
 ```
 
-The output should report the tagged version. Also check the local health
-endpoint after starting Grin:
+The output should report the tagged version. When a previous release is
+available, also verify the self-upgrade path in a disposable install directory:
 
 ```zsh
+OLD_VERSION=v0.1.0
+INSTALL_DIR=$(mktemp -d)/bin
+curl -fsSL https://raw.githubusercontent.com/duongnvt2110/grin/main/scripts/install.sh \
+  | sh -s -- --version "$OLD_VERSION" --dir "$INSTALL_DIR"
+"$INSTALL_DIR/grin" upgrade
+"$INSTALL_DIR/grin" --version
+```
+
+The final version should match the latest published stable release.
+
+Also initialize a disposable workspace and check the local health endpoint:
+
+```zsh
+mkdir -p /tmp/grin-demo
+grin init --workspace /tmp/grin-demo
 grin --workspace /tmp/grin-demo
 curl -fsS http://127.0.0.1:8765/healthz
 ```

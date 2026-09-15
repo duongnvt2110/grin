@@ -14,9 +14,29 @@ import (
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		root, help, err := config.Init(os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if help {
+			fmt.Print(config.InitUsage())
+			return
+		}
+		fmt.Println("registered workspace:", root)
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "doctor" {
 		if err := runDoctor(os.Stdout, os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "upgrade" {
+		if err := runUpgradeCLI(os.Stdout, version, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "grin upgrade:", err)
 			os.Exit(2)
 		}
 		return

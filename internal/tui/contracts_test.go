@@ -19,20 +19,23 @@ func key(text string) tea.KeyPressMsg {
 
 func TestModelGroupsLifecycleAndRoutesApproval(t *testing.T) {
 	readiness := NewReadiness()
-	model := NewModel("/workspace", "workspace", readiness)
+	model := NewModel("/workspace", "normal", readiness)
 	updated, _ := model.Update(model.Init()())
 	if err := readiness.Wait(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	model = updated.(Model)
 	model.addEvent(events.Event{ID: "start-1", ToolCallID: "tool-1", Type: events.EventRequestStarted, Tool: "fs.write_text", Summary: "request received"})
-	model.addEvent(events.Event{ID: "approval-1", ToolCallID: "tool-1", ApprovalRequestID: "approval-1", OperationDigest: "digest-1", Type: events.EventApprovalRequired, Tool: "fs.write_text", Summary: "write notes.txt", Detail: "path: notes.txt", Risk: "high"})
+	model.addEvent(events.Event{ID: "approval-1", ToolCallID: "tool-1", Workspace: "/workspace-a", ApprovalRequestID: "approval-1", OperationDigest: "digest-1", Type: events.EventApprovalRequired, Tool: "fs.write_text", Summary: "write notes.txt", Detail: "path: notes.txt", Risk: "high"})
 	model.addEvent(events.Event{ID: "approval-1", ToolCallID: "tool-1", ApprovalRequestID: "approval-1", OperationDigest: "digest-1", Type: events.EventApprovalRequired, Tool: "fs.write_text", Summary: "duplicate"})
 	if len(model.Entries) != 1 || model.Entries[0].State != StateAwaitingApproval {
 		t.Fatalf("entries = %+v", model.Entries)
 	}
 	if !strings.Contains(model.View().Content, "> ! fs.write_text   write notes.txt · approval required") {
 		t.Fatalf("view missing approval row: %s", model.View().Content)
+	}
+	if !strings.Contains(model.View().Content, "· /workspace-a") {
+		t.Fatalf("compact approval view missing workspace: %s", model.View().Content)
 	}
 	updated, _ = model.Update(key("enter"))
 	model = updated.(Model)
@@ -57,7 +60,7 @@ func TestModelGroupsLifecycleAndRoutesApproval(t *testing.T) {
 }
 
 func TestReducerTerminalStateWinsAndAllowsSafeEnrichment(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.addEvent(events.Event{ID: "completed-1", ToolCallID: "tool-1", Type: events.EventToolCompleted, Tool: "shell.run", Summary: "tool completed"})
 	model.addEvent(events.Event{ID: "approval-1", ToolCallID: "tool-1", ApprovalRequestID: "approval-1", OperationDigest: "digest-1", Type: events.EventApprovalRequired, Summary: "run sed", Detail: "command: sed", Risk: "high"})
 	model.addEvent(events.Event{ID: "running-1", ToolCallID: "tool-1", Type: events.EventRequestStarted, Summary: "request received"})
@@ -79,7 +82,7 @@ func TestReducerMapsApprovalOutcomesAndCancellation(t *testing.T) {
 		{"allowed", events.ApprovalAllowed, StateActive},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			model := NewModel("/workspace", "workspace", nil)
+			model := NewModel("/workspace", "normal", nil)
 			model.addEvent(events.Event{ID: "required", ToolCallID: "tool-1", ApprovalRequestID: "approval-1", OperationDigest: "digest-1", Type: events.EventApprovalRequired})
 			model.addEvent(events.Event{ID: "resolved", ToolCallID: "tool-1", ApprovalRequestID: "approval-1", OperationDigest: "digest-1", ApprovalOutcome: test.outcome, Type: events.EventApprovalResolved})
 			if model.Entries[0].State != test.state {
@@ -87,7 +90,7 @@ func TestReducerMapsApprovalOutcomesAndCancellation(t *testing.T) {
 			}
 		})
 	}
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.addEvent(events.Event{ID: "cancelled", ToolCallID: "tool-2", Type: events.EventCancelled})
 	if model.Entries[0].State != StateCancelled {
 		t.Fatalf("request cancellation state = %s", model.Entries[0].State)
@@ -95,7 +98,7 @@ func TestReducerMapsApprovalOutcomesAndCancellation(t *testing.T) {
 }
 
 func TestAllowedApprovalBecomesActiveAndStopsApprovalActions(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.addEvent(events.Event{ID: "required", ToolCallID: "tool-1", ApprovalRequestID: "approval-1", OperationDigest: "digest-1", Type: events.EventApprovalRequired})
 	model.addEvent(events.Event{ID: "allowed", ToolCallID: "tool-1", ApprovalRequestID: "approval-1", OperationDigest: "digest-1", ApprovalOutcome: events.ApprovalAllowed, Type: events.EventApprovalResolved})
 	if model.Entries[0].State != StateActive {
@@ -119,6 +122,11 @@ func TestExpansionOnlyAppliesToUsefulRows(t *testing.T) {
 			want:  false,
 		},
 		{
+			name:  "completed workspace row can reveal workspace",
+			entry: TranscriptEntry{Workspace: "/workspace-a", Tool: "fs.read_text", Summary: "README.md", State: StateCompleted},
+			want:  true,
+		},
+		{
 			name:  "pending shell row expands",
 			entry: TranscriptEntry{Tool: "shell.run", Summary: "go test ./...", Detail: "command: go test ./...", State: StateAwaitingApproval},
 			want:  true,
@@ -132,7 +140,7 @@ func TestExpansionOnlyAppliesToUsefulRows(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			model := NewModel("/workspace", "workspace", nil)
+			model := NewModel("/workspace", "normal", nil)
 			model.Entries = []TranscriptEntry{test.entry}
 			updated, _ := model.Update(key("enter"))
 			if got := updated.(Model).Entries[0].Expanded; got != test.want {
@@ -142,8 +150,22 @@ func TestExpansionOnlyAppliesToUsefulRows(t *testing.T) {
 	}
 }
 
+func TestCompletedWorkspaceRowsShowWorkspaceInCompactView(t *testing.T) {
+	model := NewModel("multi-workspace", "normal", nil)
+	model.Entries = []TranscriptEntry{
+		{Workspace: "/workspace-a", Tool: "fs.read_text", Summary: "README.md", State: StateCompleted},
+		{Workspace: "/workspace-b", Tool: "fs.read_text", Summary: "README.md", State: StateCompleted},
+	}
+	view := model.View().Content
+	for _, workspace := range []string{"/workspace-a", "/workspace-b"} {
+		if !strings.Contains(view, "· "+workspace) {
+			t.Fatalf("compact completed row missing workspace %q: %s", workspace, view)
+		}
+	}
+}
+
 func TestReducerDedupStateIsBounded(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.MaxEntries = 1
 	for index := 0; index < 300; index++ {
 		model.addEvent(events.Event{ID: "event-" + string(rune(index)), ToolCallID: "tool-" + string(rune(index)), Type: events.EventToolCompleted})
@@ -154,7 +176,7 @@ func TestReducerDedupStateIsBounded(t *testing.T) {
 }
 
 func TestQuitAndNoCancelAction(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	updated, _ := model.Update(key("q"))
 	if !updated.(Model).Quit {
 		t.Fatal("q did not request quit")
@@ -166,7 +188,7 @@ func TestQuitAndNoCancelAction(t *testing.T) {
 }
 
 func TestViewUsesFixedFrameAndWidth(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.Width = 24
 	model.Height = 8
 	model.addEvent(events.Event{ID: "event-1", ToolCallID: "tool-1", Type: events.EventToolCompleted, Tool: "shell.run", Summary: "a very long safe summary"})
@@ -182,7 +204,7 @@ func TestViewUsesFixedFrameAndWidth(t *testing.T) {
 }
 
 func TestNaturalHeightRendersAllRowsAndFooter(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.Width = 80
 	model.Height = 20
 	model.addEvent(events.Event{ID: "row-1", ToolCallID: "tool-1", Type: events.EventToolCompleted, Tool: "fs.read_text", Summary: "README.md"})
@@ -206,7 +228,7 @@ func TestNaturalHeightRendersAllRowsAndFooter(t *testing.T) {
 }
 
 func TestOverflowKeepsSelectedRowAndFooterVisible(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.Width = 80
 	model.Height = 8
 	for index := 1; index <= 4; index++ {
@@ -223,7 +245,7 @@ func TestOverflowKeepsSelectedRowAndFooterVisible(t *testing.T) {
 }
 
 func TestNewOrdinaryRowFollowsWhenAlreadyAtBottom(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.Width = 100
 	model.Height = 8
 
@@ -257,7 +279,7 @@ func TestNewOrdinaryRowFollowsWhenAlreadyAtBottom(t *testing.T) {
 }
 
 func TestNewRowsFollowLastSelectionAndPendingApproval(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.Width = 100
 	model.Height = 8
 	model.addEvent(events.Event{ID: "row-1", ToolCallID: "tool-1", Type: events.EventToolCompleted, Tool: "fs.read_text", Summary: "row 1"})
@@ -277,14 +299,14 @@ func TestNewRowsFollowLastSelectionAndPendingApproval(t *testing.T) {
 }
 
 func TestViewDoesNotRequestAlternateScreen(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	if model.View().AltScreen {
 		t.Fatal("natural terminal view requested alternate screen")
 	}
 }
 
 func TestFooterMatchesExpansionAvailability(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.Entries = []TranscriptEntry{{Tool: "fs.read_text", Summary: "README.md", State: StateCompleted}}
 	if view := model.View().Content; strings.Contains(view, "enter details") {
 		t.Fatalf("simple completed row advertised expansion: %s", view)
@@ -297,7 +319,7 @@ func TestFooterMatchesExpansionAvailability(t *testing.T) {
 }
 
 func TestResizeAndNavigationKeepCompactFrame(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.addEvent(events.Event{ID: "event-1", ToolCallID: "tool-1", Type: events.EventToolCompleted, Tool: "fs.read_text", Summary: "README.md"})
 	model.addEvent(events.Event{ID: "event-2", ToolCallID: "tool-2", Type: events.EventRequestStarted, Tool: "system.info", Summary: "request received"})
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 48, Height: 8})
@@ -322,7 +344,7 @@ func TestResizeAndNavigationKeepCompactFrame(t *testing.T) {
 }
 
 func TestTrimRetainsActiveAndPendingRows(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.MaxEntries = 1
 	model.addEvent(events.Event{ID: "active", ToolCallID: "tool-active", Type: events.EventRequestStarted, Tool: "system.info", Summary: "request received"})
 	model.addEvent(events.Event{ID: "pending", ToolCallID: "tool-pending", ApprovalRequestID: "approval-1", OperationDigest: "digest-1", Type: events.EventApprovalRequired, Tool: "shell.run", Summary: "go test"})
@@ -338,7 +360,7 @@ func TestTrimRetainsActiveAndPendingRows(t *testing.T) {
 }
 
 func TestInvalidApprovalIdentityDoesNotChangeRow(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.addEvent(events.Event{ID: "required", ToolCallID: "tool-1", ApprovalRequestID: "approval-1", OperationDigest: "digest-1", Type: events.EventApprovalRequired, Summary: "go test"})
 	model.addEvent(events.Event{ID: "mismatch", ToolCallID: "tool-1", ApprovalRequestID: "approval-2", OperationDigest: "digest-2", ApprovalOutcome: events.ApprovalAllowed, Type: events.EventApprovalResolved})
 	entry := model.Entries[0]
@@ -348,7 +370,7 @@ func TestInvalidApprovalIdentityDoesNotChangeRow(t *testing.T) {
 }
 
 func TestViewportUsesSelectedRenderedBlockRange(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.Entries = []TranscriptEntry{
 		{ToolCallID: "tool-1", Tool: "shell.run", Summary: "first", State: StateActive, Detail: "line one\nline two", Expanded: true},
 		{ToolCallID: "tool-2", Tool: "fs.read_text", Summary: "README.md", State: StateCompleted},
@@ -364,7 +386,7 @@ func TestViewportUsesSelectedRenderedBlockRange(t *testing.T) {
 }
 
 func TestExpandedSelectedEntryRemainsVisibleNearViewportBottom(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil)
+	model := NewModel("/workspace", "normal", nil)
 	model.Entries = []TranscriptEntry{
 		{ToolCallID: "tool-1", Tool: "fs.read_text", Summary: "row 1", State: StateCompleted},
 		{ToolCallID: "tool-2", Tool: "fs.read_text", Summary: "row 2", State: StateCompleted},
@@ -389,7 +411,7 @@ func TestExpandedSelectedEntryRemainsVisibleNearViewportBottom(t *testing.T) {
 }
 
 func TestYoloHeaderIsVisible(t *testing.T) {
-	model := NewModel("/workspace", "workspace", nil, true)
+	model := NewModel("/workspace", "yolo", nil, true)
 	view := model.View().Content
 	if !strings.Contains(view, "grin [YOLO]") {
 		t.Fatalf("YOLO header missing: %s", view)

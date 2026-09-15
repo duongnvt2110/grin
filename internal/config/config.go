@@ -26,7 +26,6 @@ type Config struct {
 	Version   int       `yaml:"version"`
 	Server    Server    `yaml:"server"`
 	Workspace Workspace `yaml:"workspace"`
-	Policy    Policy    `yaml:"policy"`
 	Limits    Limits    `yaml:"limits"`
 	Shell     Shell     `yaml:"shell"`
 	TUI       TUI       `yaml:"tui"`
@@ -40,10 +39,6 @@ type Server struct {
 
 type Workspace struct {
 	Root string `yaml:"-"`
-}
-
-type Policy struct {
-	Profile string `yaml:"profile"`
 }
 
 type Limits struct {
@@ -79,7 +74,6 @@ func Defaults() Config {
 		Version:   1,
 		Server:    Server{Bind: "127.0.0.1", Port: 8765},
 		Workspace: Workspace{Root: "."},
-		Policy:    Policy{Profile: "workspace"},
 		Limits: Limits{
 			MaxFileReadBytes: 262144, MaxFileWriteBytes: 1048576,
 			MaxSearchResults: 100, MaxSearchFiles: 10000, MaxSearchBytes: 1073741824,
@@ -99,7 +93,6 @@ func Parse(args []string) (Options, error) {
 	set := flag.NewFlagSet("grin", flag.ContinueOnError)
 	set.SetOutput(os.Stderr)
 	workspace := set.String("workspace", cfg.Workspace.Root, "workspace root")
-	profile := set.String("profile", cfg.Policy.Profile, "policy profile")
 	port := set.Int("port", cfg.Server.Port, "MCP port")
 	yolo := set.Bool("yolo", false, "bypass Grin workspace and approval restrictions")
 	help := set.Bool("help", false, "show help")
@@ -108,7 +101,6 @@ func Parse(args []string) (Options, error) {
 		return Options{}, err
 	}
 	cfg.Workspace.Root = *workspace
-	cfg.Policy.Profile = *profile
 	cfg.Server.Port = *port
 	cfg.Yolo = *yolo
 	if set.NArg() != 0 {
@@ -132,9 +124,6 @@ func Parse(args []string) (Options, error) {
 	cfg, _, err = LoadWorkspace(root)
 	if err != nil {
 		return Options{}, err
-	}
-	if explicit["profile"] {
-		cfg.Policy.Profile = *profile
 	}
 	if explicit["port"] {
 		cfg.Server.Port = *port
@@ -207,6 +196,18 @@ func LoadWorkspace(root string) (Config, bool, error) {
 }
 
 func decodeConfig(data []byte) (Config, error) {
+	var legacy struct {
+		Policy *struct {
+			Profile *string `yaml:"profile"`
+		} `yaml:"policy"`
+	}
+	if err := yaml.Unmarshal(data, &legacy); err != nil {
+		return Config{}, fmt.Errorf("parse config: %w", err)
+	}
+	if legacy.Policy != nil && legacy.Policy.Profile != nil {
+		return Config{}, errors.New("parse config: policy.profile is no longer supported; Grin now has only normal and --yolo modes; remove the policy section from .grin/config.yaml")
+	}
+
 	cfg := Defaults()
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
@@ -282,7 +283,43 @@ func isLoopbackAddress(bind string) bool {
 }
 
 func Usage() string {
-	return "Grin - supervised local MCP runtime\n\nUsage:\n  grin [--workspace PATH] [--profile NAME] [--port PORT] [--yolo]\n  grin --help\n  grin --version\n\nIf --workspace is omitted, Grin searches upward for the nearest .grin/config.yaml.\n--yolo bypasses Grin workspace and approval restrictions for supported tools; OS permissions and runtime limits still apply.\nV1 is interactive; --headless is not supported.\n"
+	return "Grin - supervised local MCP runtime\n\nUsage:\n  grin [--workspace PATH] [--port PORT] [--yolo]\n  grin init [--workspace PATH]\n  grin doctor [--workspace PATH] [--port PORT] [--check-ready]\n  grin upgrade\n  grin --help\n  grin --version\n\nIf --workspace is omitted, Grin searches upward for the nearest .grin/config.yaml.\ninit creates the local workspace config when needed and registers its canonical path for normal-mode routing.\nupgrade installs the latest stable GitHub release when a newer version is available.\n--yolo bypasses Grin workspace and approval restrictions for supported tools; OS permissions and runtime limits still apply.\nV1 is interactive; --headless is not supported.\n"
+}
+
+func Init(args []string) (string, bool, error) {
+	set := flag.NewFlagSet("grin init", flag.ContinueOnError)
+	set.SetOutput(os.Stderr)
+	workspace := set.String("workspace", "", "workspace root")
+	help := set.Bool("help", false, "show init help")
+	if err := set.Parse(args); err != nil {
+		return "", false, err
+	}
+	if *help {
+		return "", true, nil
+	}
+	if set.NArg() != 0 {
+		return "", false, fmt.Errorf("unexpected arguments: %s", strings.Join(set.Args(), " "))
+	}
+	root := *workspace
+	if root == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", false, fmt.Errorf("get current directory: %w", err)
+		}
+		if found, ok, err := FindWorkspaceRoot(cwd); err != nil {
+			return "", false, err
+		} else if ok {
+			root = found
+		} else {
+			root = cwd
+		}
+	}
+	registered, err := InitializeWorkspace(root)
+	return registered, false, err
+}
+
+func InitUsage() string {
+	return "Usage: grin init [--workspace PATH]\n\nCreates the local workspace config when needed and registers its canonical path for normal-mode routing.\n"
 }
 
 func (s Server) Address() string { return s.Bind + ":" + strconv.Itoa(s.Port) }

@@ -31,6 +31,7 @@ const (
 type ApprovalRequest struct {
 	ID              string    `json:"id"`
 	ToolCallID      string    `json:"tool_call_id"`
+	Workspace       string    `json:"workspace,omitempty"`
 	OperationDigest string    `json:"operation_digest"`
 	Capability      string    `json:"capability"`
 	Summary         string    `json:"summary"`
@@ -254,7 +255,7 @@ func (m *Manager) publishResolution(request ApprovalRequest, decision ApprovalDe
 }
 
 func approvalEvent(request ApprovalRequest, eventType events.EventType, status events.Status, decisions ...ApprovalDecision) events.Event {
-	event := events.Event{ToolCallID: request.ToolCallID, ApprovalRequestID: request.ID, OperationDigest: request.OperationDigest, Type: eventType, Tool: request.Capability, Summary: request.Summary, Detail: request.Detail, Risk: string(request.Risk), Status: status, Time: request.CreatedAt}
+	event := events.Event{ToolCallID: request.ToolCallID, Workspace: request.Workspace, ApprovalRequestID: request.ID, OperationDigest: request.OperationDigest, Type: eventType, Tool: request.Capability, Summary: request.Summary, Detail: request.Detail, Risk: string(request.Risk), Status: status, Time: request.CreatedAt}
 	if len(decisions) > 0 {
 		event.Time = decisions[0].ResolvedAt
 		event.ApprovalOutcome = decisions[0].Outcome

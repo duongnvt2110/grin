@@ -44,7 +44,7 @@ func New(cfg config.Config, version string) (*Application, error) {
 	bus := events.New(cfg.Limits.EventBufferSize)
 	approvalManager := approval.New(bus, cfg.Limits.ApprovalTimeout)
 	readiness := tui.NewReadiness()
-	mcpServer := grinmcp.NewServer(grinmcp.Dependencies{Filesystem: files, Runtime: runtimeService, Git: gitService, Config: cfg, Version: version, Events: bus, Approval: approvalManager, Policy: policy.New(cfg.Policy.Profile, cfg.Yolo)})
+	mcpServer := grinmcp.NewServer(grinmcp.Dependencies{Filesystem: files, Runtime: runtimeService, Git: gitService, Config: cfg, Version: version, Events: bus, Approval: approvalManager, Policy: policy.New(cfg.Yolo)})
 	application := &Application{Config: cfg, bus: bus, approval: approvalManager, readiness: readiness, input: os.Stdin, output: os.Stdout}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", grinmcp.Handler(mcpServer))

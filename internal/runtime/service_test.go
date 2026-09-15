@@ -62,6 +62,59 @@ func TestIsDestructiveCommand(t *testing.T) {
 	}
 }
 
+func TestRedactCommandPreservesSensitiveArgumentRedaction(t *testing.T) {
+	tests := []struct {
+		name string
+		flag string
+	}{
+		{name: "token", flag: "--token"},
+		{name: "password", flag: "--password"},
+		{name: "passwd", flag: "--passwd"},
+		{name: "secret", flag: "--secret"},
+		{name: "api key", flag: "--api-key"},
+		{name: "private key", flag: "--private-key"},
+		{name: "credential", flag: "--credential"},
+		{name: "auth", flag: "--auth"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := RedactCommand("tool", []string{test.flag, "secret-value"})
+			want := "tool " + test.flag + " <redacted>"
+			if got != want {
+				t.Fatalf("RedactCommand() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRedactCommandRedactsAssignmentsWithoutChangingArguments(t *testing.T) {
+	args := []string{
+		"HOME=/Users/example",
+		"DATABASE_URL=https://user:pass@example.com",
+		"FOO=hello world",
+		"go",
+		"run",
+		"review_tmp.go",
+	}
+	original := append([]string(nil), args...)
+	got := RedactCommand("env", args)
+	want := "env HOME=<redacted> DATABASE_URL=<redacted> FOO=<redacted> go run review_tmp.go"
+	if got != want {
+		t.Fatalf("RedactCommand() = %q, want %q", got, want)
+	}
+	if strings.Join(args, "\x00") != strings.Join(original, "\x00") {
+		t.Fatalf("RedactCommand() modified arguments: got=%q want=%q", args, original)
+	}
+}
+
+func TestRedactProcessTextUsesBestEffortFlattenedFields(t *testing.T) {
+	got := redactProcessText("env FOO=hello world app")
+	want := "env FOO=<redacted> world app"
+	if got != want {
+		t.Fatalf("redactProcessText() = %q, want %q", got, want)
+	}
+}
+
 func testService(t *testing.T) *Service {
 	t.Helper()
 	root := t.TempDir()
