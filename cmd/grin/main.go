@@ -21,6 +21,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "upgrade" {
+		if err := runUpgradeCLI(os.Stdout, version, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "grin upgrade:", err)
+			os.Exit(2)
+		}
+		return
+	}
 	options, err := config.Parse(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
