@@ -16,6 +16,10 @@ import (
 )
 
 func TestHelperProcess(t *testing.T) {
+	if len(os.Args) > 0 && os.Args[len(os.Args)-1] == "--grin-print-environment" {
+		_, _ = fmt.Println(strings.Join(os.Environ(), "\n"))
+		os.Exit(0)
+	}
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
 	}
@@ -198,13 +202,17 @@ func TestRunCommandSafeEnvironmentFiltersGitVariables(t *testing.T) {
 			t.Setenv("GIT_DIR", filepath.Join(root, "redirected.git"))
 			t.Setenv("GIT_WORK_TREE", filepath.Join(root, "redirected-worktree"))
 			result, err := service.RunCommand(context.Background(), RunCommandRequest{
-				Executable:      "env",
+				Executable:      os.Args[0],
+				Args:            []string{"-test.run=TestHelperProcess", "--", "--grin-print-environment"},
 				Cwd:             ".",
 				Timeout:         5 * time.Second,
 				SafeEnvironment: true,
 			})
 			if err != nil {
 				t.Fatal(err)
+			}
+			if result.ExitCode != 0 {
+				t.Fatalf("safe environment probe exited with %d: stdout=%q stderr=%q", result.ExitCode, result.Stdout, result.Stderr)
 			}
 			if strings.Contains(result.Stdout, "GIT_DIR=") || strings.Contains(result.Stdout, "GIT_WORK_TREE=") {
 				t.Fatalf("safe environment leaked repository redirect variables: %q", result.Stdout)
