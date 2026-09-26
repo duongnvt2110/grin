@@ -8,6 +8,7 @@ Use this page to choose the shortest guide for what you are trying to do.
 | Understand normal mode vs YOLO | [README modes](../README.md#modes) |
 | See every CLI command and option | [README CLI reference](../README.md#cli) |
 | Connect Grin to ChatGPT with Secure MCP Tunnel | [ChatGPT + tunnel onboarding](onboarding.md) |
+| Queue, review once, loop, or manually resume ChatGPT ↔ Codex work | [Codex review](codex-review.md) |
 | Understand the runtime architecture and request flow | [System and components](components.md) |
 | Review tools, modes, and current safety boundaries | [Features and boundaries](features.md) |
 | Publish Grin binaries | [Release guide](releasing.md) |
@@ -22,6 +23,9 @@ README.md
 
 onboarding.md
   full ChatGPT + Secure MCP Tunnel tutorial
+
+codex-review.md
+  queue Codex work, run a single review or review loop, and manually resume results
 
 components.md
   system architecture, state/config ownership, request flows

@@ -7,13 +7,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"grin/internal/config"
 	"grin/internal/errs"
+	"grin/internal/redaction"
 )
 
 type Service struct {
@@ -103,22 +103,24 @@ type SearchOutput struct {
 
 var errSearchComplete = errors.New("search result limit reached")
 
-var readAssignmentPattern = regexp.MustCompile(`^(\s*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?\s*)([:=])(\s*)(.*)$`)
-var readURLCredentialPattern = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)([A-Za-z0-9._~%+-]+):([A-Za-z0-9._~%:+-]+)@([A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]+\])`)
-
-var readSensitiveNames = []string{
-	"password", "passwd", "pwd", "secret", "token",
-	"credential", "credentials", "creds", "authorization",
+var sensitiveReadBasenames = map[string]struct{}{
+	".env":             {},
+	".netrc":           {},
+	".git-credentials": {},
+	"credentials":      {},
+	"credentials.json": {},
+	"id_rsa":           {},
+	"id_dsa":           {},
+	"id_ecdsa":         {},
+	"id_ed25519":       {},
 }
 
-var readSensitiveCompoundSuffixes = []string{
-	"apikey", "authkey", "accesskey", "accesskeyid", "secretkey", "secretaccesskey",
-	"privatekey", "servicekey", "accountkey", "clientkey", "dbkey", "databasekey",
-	"clientsecret", "consumersecret", "jwtsecret",
-	"accesstoken", "refreshtoken", "authtoken", "apitoken", "jwttoken",
-	"dbpassword", "databasepassword", "dbpasswd", "databasepasswd",
-	"dbpwd", "databasepwd", "dbpass", "databasepass",
+var sensitiveReadExtensions = map[string]struct{}{
+	".p12": {},
+	".pfx": {},
 }
+
+var readSensitiveNames = []string{}
 
 func New(root string, limits config.Limits, yoloFlag ...bool) (*Service, error) {
 	yolo := len(yoloFlag) > 0 && yoloFlag[0]
@@ -228,6 +230,9 @@ func (s *Service) ReadText(_ context.Context, input ReadInput, allowOutside bool
 	if err != nil {
 		return ReadOutput{}, err
 	}
+	if sensitiveReadPath(input.Path) || sensitiveReadPath(path) {
+		return ReadOutput{}, errs.New(errs.ErrSensitiveFileBlocked, "sensitive file read is blocked", false)
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return ReadOutput{}, fileError(err)
@@ -254,79 +259,26 @@ func (s *Service) ReadText(_ context.Context, input ReadInput, allowOutside bool
 	if !utf8.Valid(data) || strings.IndexByte(string(data), 0) >= 0 {
 		return ReadOutput{}, errs.New(errs.ErrInvalidInput, "file is not valid text", false)
 	}
-	content := redactSensitiveContent(string(data))
+	if redaction.ContainsPrivateKey(string(data)) {
+		return ReadOutput{}, errs.New(errs.ErrSensitiveFileBlocked, "sensitive file read is blocked", false)
+	}
+	content := redaction.SanitizeText(string(data))
 	return ReadOutput{Path: s.relative(path), Content: content, Bytes: int64(len(data))}, nil
 }
 
-func redactSensitiveContent(content string) string {
-	var result strings.Builder
-	result.Grow(len(content))
-	for _, line := range strings.SplitAfter(content, "\n") {
-		body := line
-		terminator := ""
-		if strings.HasSuffix(body, "\n") {
-			body = strings.TrimSuffix(body, "\n")
-			terminator = "\n"
-			if strings.HasSuffix(body, "\r") {
-				body = strings.TrimSuffix(body, "\r")
-				terminator = "\r\n"
-			}
-		}
-
-		replacedAssignment := false
-		if match := readAssignmentPattern.FindStringSubmatch(body); match != nil {
-			shortDeclaration := match[3] == ":" && match[4] == "" && strings.HasPrefix(match[5], "=")
-			if !shortDeclaration && sensitiveReadName(match[2]) {
-				body = match[1] + match[3] + match[4] + redactSensitiveValue(match[5])
-				replacedAssignment = true
-			}
-		}
-		if !replacedAssignment {
-			if redacted, ok := redactURLCredentials(body); ok {
-				body = redacted
-			}
-		}
-		result.WriteString(body)
-		result.WriteString(terminator)
+func sensitiveReadPath(value string) bool {
+	clean := filepath.Clean(value)
+	base := strings.ToLower(filepath.Base(clean))
+	if base == ".env" || strings.HasPrefix(base, ".env.") {
+		return true
 	}
-	return result.String()
-}
-
-func sensitiveReadName(name string) bool {
-	lower := strings.ToLower(name)
-	for _, candidate := range readSensitiveNames {
-		if lower == candidate || strings.HasSuffix(lower, "_"+candidate) || strings.HasSuffix(lower, "-"+candidate) || strings.HasSuffix(lower, "."+candidate) {
-			return true
-		}
+	if _, ok := sensitiveReadBasenames[base]; ok {
+		return true
 	}
-	normalized := strings.NewReplacer("_", "", "-", "", ".", "").Replace(lower)
-	for _, suffix := range readSensitiveCompoundSuffixes {
-		if strings.HasSuffix(normalized, suffix) {
-			return true
-		}
+	if _, ok := sensitiveReadExtensions[strings.ToLower(filepath.Ext(base))]; ok {
+		return true
 	}
 	return false
-}
-
-func redactSensitiveValue(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	comma := ""
-	if strings.HasSuffix(trimmed, ",") {
-		trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, ","))
-		comma = ","
-	}
-	if len(trimmed) >= 2 && (trimmed[0] == '"' || trimmed[0] == '\'') && trimmed[len(trimmed)-1] == trimmed[0] {
-		quote := string(trimmed[0])
-		return quote + "<redacted>" + quote + comma
-	}
-	return "<redacted>"
-}
-
-func redactURLCredentials(value string) (string, bool) {
-	if !readURLCredentialPattern.MatchString(value) {
-		return value, false
-	}
-	return readURLCredentialPattern.ReplaceAllString(value, `${1}<redacted>@${4}`), true
 }
 
 func (s *Service) ValidateWrite(input WriteInput) error {
@@ -622,6 +574,21 @@ func (s *Service) ClassifyExisting(input string) (bool, error) {
 		return false, fileError(err)
 	}
 	return !within(s.root, canonical), nil
+}
+
+func (s *Service) ClassifyReadText(input string) (bool, error) {
+	if sensitiveReadPath(input) {
+		return false, errs.New(errs.ErrSensitiveFileBlocked, "sensitive file read is blocked", false)
+	}
+	outside, err := s.ClassifyExisting(input)
+	if err != nil {
+		return false, err
+	}
+	candidate := s.workspacePath(input)
+	if path, resolveErr := filepath.EvalSymlinks(candidate); resolveErr == nil && sensitiveReadPath(path) {
+		return false, errs.New(errs.ErrSensitiveFileBlocked, "sensitive file read is blocked", false)
+	}
+	return outside, nil
 }
 
 func (s *Service) ClassifyCreate(input string) (bool, error) {

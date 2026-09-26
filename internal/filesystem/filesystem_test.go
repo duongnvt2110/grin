@@ -5,11 +5,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"grin/internal/config"
 	"grin/internal/errs"
+	"grin/internal/redaction"
 )
 
 func testService(t *testing.T) (*Service, string) {
@@ -30,11 +32,15 @@ func TestRedactSensitiveContent(t *testing.T) {
 		want  string
 	}{
 		{name: "password", input: "PASSWORD=secret", want: "PASSWORD=<redacted>"},
+		{name: "export password", input: "export PASSWORD=secret", want: "export PASSWORD=<redacted>"},
+		{name: "inline json fields", input: `{"host":"localhost","password":"secret","api_key":"secret"}`, want: `{"host":"localhost","password":"<redacted>","api_key":"<redacted>"}`},
 		{name: "spacing", input: "PASSWORD = secret", want: "PASSWORD = <redacted>"},
 		{name: "quoted json", input: `"api_key": "secret",`, want: `"api_key": "<redacted>",`},
 		{name: "camel secret", input: "clientSecret=secret", want: "clientSecret=<redacted>"},
 		{name: "refresh token", input: "refresh_token=secret", want: "refresh_token=<redacted>"},
 		{name: "provider key", input: "OPENAI_API_KEY=secret", want: "OPENAI_API_KEY=<redacted>"},
+		{name: "cookie header", input: "Cookie: session=secret", want: "Cookie: <redacted>"},
+		{name: "set-cookie header", input: "Set-Cookie: session=secret", want: "Set-Cookie: <redacted>"},
 		{name: "token metadata", input: "TOKEN_LIMIT=8192", want: "TOKEN_LIMIT=8192"},
 		{name: "password metadata", input: "PASSWORD_POLICY=min12", want: "PASSWORD_POLICY=min12"},
 		{name: "author", input: "AUTHOR=alice", want: "AUTHOR=alice"},
@@ -51,8 +57,8 @@ func TestRedactSensitiveContent(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := redactSensitiveContent(test.input); got != test.want {
-				t.Fatalf("redactSensitiveContent() = %q, want %q", got, test.want)
+			if got := redaction.SanitizeText(test.input); got != test.want {
+				t.Fatalf("redaction.SanitizeText() = %q, want %q", got, test.want)
 			}
 		})
 	}
@@ -78,6 +84,90 @@ func TestReadTextRedactsSensitiveContent(t *testing.T) {
 	}
 	if result.Bytes != int64(len(content)) {
 		t.Fatalf("ReadText bytes = %d, want %d", result.Bytes, len(content))
+	}
+}
+
+func TestReadTextBlocksSensitivePaths(t *testing.T) {
+	service, root := testService(t)
+	tests := []string{
+		".env",
+		".env.local",
+		".netrc",
+		".git-credentials",
+		"credentials",
+		"credentials.json",
+		"id_rsa",
+		"id_dsa",
+		"id_ecdsa",
+		"id_ed25519",
+		"bundle.p12",
+		"bundle.pfx",
+	}
+	for _, name := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(root, name)
+			if err := os.WriteFile(path, []byte("GRIN_BLOCKED_SECRET"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := service.ReadText(context.Background(), ReadInput{Path: name}, false)
+			var typed errs.Error
+			if !errors.As(err, &typed) || typed.Code != errs.ErrSensitiveFileBlocked {
+				t.Fatalf("ReadText error = %v, want %s", err, errs.ErrSensitiveFileBlocked)
+			}
+			if strings.Contains(typed.Message, "GRIN_BLOCKED_SECRET") {
+				t.Fatal("blocked-read error leaked the sentinel")
+			}
+		})
+	}
+}
+
+func TestReadTextBlocksCanonicalSensitivePath(t *testing.T) {
+	service, root := testService(t)
+	target := filepath.Join(root, ".env")
+	if err := os.WriteFile(target, []byte("GRIN_BLOCKED_SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "safe.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	_, err := service.ReadText(context.Background(), ReadInput{Path: "safe.txt"}, false)
+	var typed errs.Error
+	if !errors.As(err, &typed) || typed.Code != errs.ErrSensitiveFileBlocked {
+		t.Fatalf("ReadText error = %v, want %s", err, errs.ErrSensitiveFileBlocked)
+	}
+}
+
+func TestReadTextBlocksPrivateKeyContent(t *testing.T) {
+	service, root := testService(t)
+	markers := []string{
+		"-----BEGIN PRIVATE KEY-----",
+		"-----BEGIN RSA PRIVATE KEY-----",
+		"-----BEGIN OPENSSH PRIVATE KEY-----",
+	}
+	for index, marker := range markers {
+		t.Run(strconv.Itoa(index), func(t *testing.T) {
+			path := filepath.Join(root, "note-"+strconv.Itoa(index)+".txt")
+			if err := os.WriteFile(path, []byte("header\n"+marker+"\nfooter\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := service.ReadText(context.Background(), ReadInput{Path: filepath.Base(path)}, false)
+			var typed errs.Error
+			if !errors.As(err, &typed) || typed.Code != errs.ErrSensitiveFileBlocked {
+				t.Fatalf("ReadText error = %v, want %s", err, errs.ErrSensitiveFileBlocked)
+			}
+		})
+	}
+
+	for name, content := range map[string]string{
+		"certificate.txt": "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n",
+		"public-key.txt":  "-----BEGIN PUBLIC KEY-----\npublic\n-----END PUBLIC KEY-----\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.ReadText(context.Background(), ReadInput{Path: name}, false); err != nil {
+			t.Fatalf("public content %s rejected: %v", name, err)
+		}
 	}
 }
 

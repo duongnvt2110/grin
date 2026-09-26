@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"grin/internal/approval"
+	"grin/internal/codex"
 	"grin/internal/config"
 	"grin/internal/errs"
 	"grin/internal/events"
@@ -32,15 +33,73 @@ var nextToolCallID uint64
 const serverInstructions = `Grin provides local workspace capabilities subject to the active policy.
 
 In normal mode, workspace.list is global. Every filesystem, Git, shell, and
-workspace.info request must include an absolute workspace path returned by
-workspace.list. Grin selects only an exact registered workspace; it never
-guesses, falls back, or changes workspace state from conversation context.
-When the user names a workspace, use that exact path. Otherwise reuse the
-workspace already established in the conversation. If none is established,
-call workspace.list: tell the user when it is empty, use the only result when
-there is one, and ask the user to choose when there are several.
-YOLO mode keeps the single startup workspace behavior and does not require the
-workspace selector.
+workspace.info request must include an absolute workspace path. Grin selects
+only an exact registered workspace; it never guesses, falls back, or changes
+workspace state from conversation context. First determine the target project
+from the task and conversation. Use its exact known workspace path directly,
+including when the project is identified by name. workspace.list discovers
+registered workspaces; it does not select the target for a task. When the exact
+path is unknown, use workspace.list only to find candidates matching the task.
+Never choose a workspace just because it is the only or first result. If no
+candidate matches clearly, ask the user which workspace to use. Reuse the
+established workspace only while the task remains in that project.
+YOLO mode keeps the single startup workspace behavior for filesystem, Git, and
+shell tools. Codex tools always require an explicit workspace: Normal mode
+requires a registered workspace, while YOLO may target any existing absolute
+workspace.
+
+For Codex review work, determine the task's exact target workspace before
+session discovery. Call codex.list with that workspace only; never use a
+workspace.list result as the target merely because it is the only result. Use
+only threads returned for that exact workspace. If none match, tell the user to
+open Codex there; if multiple match, ask which thread to use. Keep the exact
+workspace and thread_id pair for follow-up requests in the same review. Before
+queueing, use that same workspace/thread pair. On workspace change, discard
+the old thread selection and call codex.list for the new exact workspace. Do
+not use shell.run to drive normal Codex review work.
+
+Codex review supports three behaviors:
+
+QUEUE ONLY: use this only when the user explicitly asks to send/queue a message
+without waiting for or reviewing the result. Call codex.queue, return the
+workspace, thread_id, and request_id, then stop.
+
+SINGLE REVIEW: use this for a normal request to send something to Codex, ask
+Codex to review once, or review with Codex when the user did not explicitly ask
+for a repeated loop. Call codex.queue, then immediately call codex.turn_result
+with the returned thread_id and request_id. While the result is pending or
+inProgress, continue checking the same request; do not queue a duplicate. When
+completed, independently review the Codex result once, present the assessment
+to the user, and stop. If the result is interrupted, stop, report the
+interruption, preserve workspace/thread_id/request_id, and do not automatically
+queue a replacement. Retry only after the user explicitly asks; re-run
+codex.list before queueing a fresh request. Do not automatically send findings
+back to Codex. If the result is failed, stop, report the failure, preserve
+workspace/thread_id/request_id, and do not automatically queue another request.
+Retry only after the user explicitly asks; re-run codex.list before queueing a
+fresh request.
+
+REVIEW LOOP: use this only when the user explicitly asks to start/continue a
+review loop, review until no material findings remain, or reach a named loop
+stop condition. Call codex.queue, retrieve the exact result with
+codex.turn_result, and independently review it. If material findings remain,
+send only those findings back to the same Codex thread and repeat the
+queue/result/review cycle. If any result is interrupted, break the automatic
+loop, report the interruption, preserve workspace/thread_id/request_id, and do
+not queue the next review request. If any result is failed, break the automatic
+loop, report the failure, preserve workspace/thread_id/request_id, and do not
+queue the next review request. Resume only after the user explicitly asks to
+continue; re-run codex.list before queueing a fresh request. Before the user
+explicitly says IMPLEMENT, Codex work is review/reconciliation only and the
+loop stops at READY_FOR_IMPLEMENT. Do not generate, infer, or queue IMPLEMENT;
+wait for the user's explicit command. Only after that command may Codex modify
+the approved production scope. After implementation, continue independent
+review and corrections until NO_MATERIAL_FINDINGS.
+
+A successful codex.queue call alone does not complete SINGLE REVIEW or REVIEW
+LOOP. If tool execution cannot continue before a result becomes terminal,
+return the workspace, thread_id, and request_id so the user can manually resume
+that exact request later.
 
 For repository coding, review, planning, or implementation tasks, read the
 workspace-root AGENTS.md with fs.read_text when it exists before acting on the
@@ -57,11 +116,18 @@ type Dependencies struct {
 	Filesystem *filesystem.Service
 	Runtime    *grinruntime.Service
 	Git        *gringit.Service
+	Codex      codexTools
 	Config     config.Config
 	Version    string
 	Events     events.Publisher
 	Approval   *approval.Manager
 	Policy     policy.Evaluator
+}
+
+type codexTools interface {
+	List(context.Context, string) (codex.ListResult, error)
+	Queue(context.Context, string, string, string) (codex.QueueResult, error)
+	TurnResult(context.Context, string, string, string, int64) (codex.TurnResult, error)
 }
 
 func NewServer(deps Dependencies) *sdk.Server {
@@ -79,19 +145,97 @@ func NewServer(deps Dependencies) *sdk.Server {
 		}
 		return toolResult{Value: deps.Filesystem.Info(), Summary: "selected workspace"}, nil
 	})
-	if !deps.Config.Yolo {
-		addTool(server, deps, false, "workspace.list", "Discover registered Grin workspaces. In normal mode, call this before any workspace-scoped tool when the user has not provided an exact absolute workspace path. If multiple workspaces are returned, ask the user to choose; never guess.", objectSchema(map[string]any{}), func(_ context.Context, _ Dependencies, _ string, raw json.RawMessage) (any, error) {
-			var input emptyInput
-			if err := decode(raw, &input); err != nil {
-				return nil, errs.New(errs.ErrInvalidInput, "invalid workspace.list arguments", false)
-			}
-			workspaces, err := config.LoadRegistry()
-			if err != nil {
-				return nil, errs.New(errs.ErrWorkspaceUnavailable, "workspace registry is unavailable", true)
-			}
-			return toolResult{Value: map[string]any{"workspaces": workspaces}, Summary: "list workspaces"}, nil
-		})
-	}
+	addTool(server, deps, false, "workspace.list", "Discover registered Grin workspaces. In normal mode, use this only when the task's exact target path cannot be established from the task or conversation; treat results as candidates matching the task, and never choose the first or only result by default. In YOLO mode, it returns the configured startup workspace for compatibility and does not enable routing.", objectSchema(map[string]any{}), func(_ context.Context, deps Dependencies, _ string, raw json.RawMessage) (any, error) {
+		var input emptyInput
+		if err := decode(raw, &input); err != nil {
+			return nil, errs.New(errs.ErrInvalidInput, "invalid workspace.list arguments", false)
+		}
+		if deps.Config.Yolo {
+			return toolResult{Value: map[string]any{"workspaces": []string{deps.Filesystem.Root()}}, Summary: "list workspaces"}, nil
+		}
+		workspaces, err := config.LoadRegistry()
+		if err != nil {
+			return nil, errs.New(errs.ErrWorkspaceUnavailable, "workspace registry is unavailable", true)
+		}
+		return toolResult{Value: map[string]any{"workspaces": workspaces}, Summary: "list workspaces"}, nil
+	})
+	addTool(server, deps, false, "codex.list", "Find currently running top-level Codex sessions for an explicit workspace. Normal mode requires a registered workspace; YOLO accepts any existing absolute workspace.", objectSchema(map[string]any{}), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
+		var input emptyInput
+		if err := decode(raw, &input); err != nil {
+			return nil, errs.New(errs.ErrInvalidInput, "invalid codex.list arguments", false)
+		}
+		if deps.Codex == nil {
+			return nil, errs.New(errs.ErrUnsupported, "Codex tools are unavailable", false)
+		}
+		workspace := deps.Config.Workspace.Root
+		operation := policy.Operation{Tool: "codex.list", Capability: "codex.inspect", Arguments: map[string]string{"workspace": workspace}}
+		if err := authorize(ctx, deps, toolCallID, operation, "list Codex sessions", "workspace: "+workspace, approval.RiskLow); err != nil {
+			return nil, err
+		}
+		result, err := deps.Codex.List(ctx, workspace)
+		if err != nil {
+			return nil, err
+		}
+		return toolResult{Value: result, Summary: "Codex sessions listed"}, nil
+	})
+	addTool(server, deps, false, "codex.queue", "Queue a message to an exact currently running Codex thread. A successful response means accepted for queueing, not that execution has started.", objectSchema(map[string]any{
+		"thread_id": map[string]any{"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36},
+		"message":   map[string]any{"type": "string", "minLength": 1},
+	}, "thread_id", "message"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
+		var input struct {
+			ThreadID string `json:"thread_id"`
+			Message  string `json:"message"`
+		}
+		if err := decode(raw, &input); err != nil {
+			return nil, errs.New(errs.ErrInvalidInput, "invalid codex.queue arguments", false)
+		}
+		if deps.Codex == nil {
+			return nil, errs.New(errs.ErrUnsupported, "Codex tools are unavailable", false)
+		}
+		workspace := deps.Config.Workspace.Root
+		live, err := deps.Codex.List(ctx, workspace)
+		if err != nil {
+			return nil, err
+		}
+		if !live.Running || !hasCodexThread(live.Matches, input.ThreadID) {
+			return nil, errs.New(errs.ErrNotFound, "the requested Codex thread is not running in this workspace", false)
+		}
+		operation := policy.Operation{Tool: "codex.queue", Capability: "codex.queue", Arguments: map[string]string{"thread_id": input.ThreadID}}
+		if err := authorize(ctx, deps, toolCallID, operation, "queue Codex review", "thread: "+input.ThreadID, approval.RiskLow); err != nil {
+			return nil, err
+		}
+		result, err := deps.Codex.Queue(ctx, workspace, input.ThreadID, input.Message)
+		if err != nil {
+			return nil, err
+		}
+		return toolResult{Value: result, Summary: "Codex request accepted: " + result.RequestID}, nil
+	})
+	addTool(server, deps, false, "codex.turn_result", "Read the exact Codex turn associated with a request ID. Pending results can be retried with the same IDs.", objectSchema(map[string]any{
+		"thread_id":  map[string]any{"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36},
+		"request_id": map[string]any{"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36},
+	}, "thread_id", "request_id"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
+		var input struct {
+			ThreadID  string `json:"thread_id"`
+			RequestID string `json:"request_id"`
+		}
+		if err := decode(raw, &input); err != nil {
+			return nil, errs.New(errs.ErrInvalidInput, "invalid codex.turn_result arguments", false)
+		}
+		if deps.Codex == nil {
+			return nil, errs.New(errs.ErrUnsupported, "Codex tools are unavailable", false)
+		}
+		workspace := deps.Config.Workspace.Root
+		operation := policy.Operation{Tool: "codex.turn_result", Capability: "codex.history.read", Arguments: map[string]string{"thread_id": input.ThreadID, "request_id": input.RequestID}}
+		if err := authorize(ctx, deps, toolCallID, operation, "read Codex result", "thread: "+input.ThreadID, approval.RiskLow); err != nil {
+			return nil, err
+		}
+		result, err := deps.Codex.TurnResult(ctx, workspace, input.ThreadID, input.RequestID, deps.Config.Limits.MaxShellStdoutBytes)
+		if err != nil {
+			return nil, err
+		}
+		summary := "Codex turn " + result.Status
+		return toolResult{Value: result, Summary: summary}, nil
+	})
 	addTool(server, deps, true, "fs.list", "List bounded entries subject to the active Grin policy.", objectSchema(map[string]any{
 		"path":        map[string]any{"type": "string"},
 		"depth":       map[string]any{"type": "integer", "minimum": 0},
@@ -146,7 +290,7 @@ func NewServer(deps Dependencies) *sdk.Server {
 		if err := decode(raw, &input); err != nil {
 			return nil, errs.New(errs.ErrInvalidInput, "invalid fs.read_text arguments", false)
 		}
-		outside, err := deps.Filesystem.ClassifyExisting(input.Path)
+		outside, err := deps.Filesystem.ClassifyReadText(input.Path)
 		if err != nil {
 			return nil, err
 		}
@@ -461,7 +605,7 @@ func authorize(ctx context.Context, deps Dependencies, toolCallID string, operat
 		decision = deps.Policy.Evaluate(ctx, operation)
 	}
 	workspace := ""
-	if !deps.Config.Yolo && isWorkspaceScopedTool(operation.Tool) {
+	if isCodexTool(operation.Tool) || (!deps.Config.Yolo && isWorkspaceScopedTool(operation.Tool)) {
 		workspace = deps.Config.Workspace.Root
 	}
 	publish(deps.Events, events.Event{ToolCallID: toolCallID, Workspace: workspace, Type: events.EventPolicyDecision, Tool: operation.Tool, Summary: decision.Reason, Status: events.StatusRunning, Time: time.Now()})
@@ -495,13 +639,17 @@ func authorize(ctx context.Context, deps Dependencies, toolCallID string, operat
 }
 
 func isWorkspaceScopedTool(name string) bool {
-	return name == "workspace.info" || strings.HasPrefix(name, "fs.") || strings.HasPrefix(name, "git.") || name == "shell.run"
+	return name == "workspace.info" || strings.HasPrefix(name, "fs.") || strings.HasPrefix(name, "git.") || name == "shell.run" || isCodexTool(name)
+}
+
+func isCodexTool(name string) bool {
+	return name == "codex.list" || name == "codex.queue" || name == "codex.turn_result"
 }
 
 type rawToolHandler func(context.Context, Dependencies, string, json.RawMessage) (any, error)
 
 func addTool(server *sdk.Server, base Dependencies, workspaceScoped bool, name, description string, inputSchema any, handler rawToolHandler) {
-	if workspaceScoped && !base.Config.Yolo {
+	if isCodexTool(name) || (workspaceScoped && !base.Config.Yolo) {
 		inputSchema = workspaceSchema(inputSchema)
 	}
 	server.AddTool(&sdk.Tool{Name: name, Description: description, InputSchema: inputSchema}, func(ctx context.Context, request *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
@@ -509,6 +657,21 @@ func addTool(server *sdk.Server, base Dependencies, workspaceScoped bool, name, 
 		deps := base
 		workspace := ""
 		raw := request.Params.Arguments
+		if isCodexTool(name) {
+			var err error
+			workspace, raw, deps, err = selectCodexWorkspace(base, raw)
+			if err != nil {
+				publish(base.Events, events.Event{ToolCallID: toolCallID, Type: events.EventToolFailed, Tool: name, Summary: "workspace selection failed", Status: events.StatusFailed, Time: time.Now()})
+				return toolError(err), nil
+			}
+		} else if workspaceScoped && base.Config.Yolo {
+			var err error
+			raw, err = normalizeYOLOWorkspace(raw, base.Filesystem.Root())
+			if err != nil {
+				publish(base.Events, events.Event{ToolCallID: toolCallID, Type: events.EventToolFailed, Tool: name, Summary: "workspace compatibility failed", Status: events.StatusFailed, Time: time.Now()})
+				return toolError(err), nil
+			}
+		}
 		if workspaceScoped && !base.Config.Yolo {
 			var err error
 			workspace, raw, deps, err = selectWorkspace(base, raw)
@@ -531,6 +694,10 @@ func addTool(server *sdk.Server, base Dependencies, workspaceScoped bool, name, 
 				status = events.StatusCancelled
 			}
 			summary := displaySummary
+			if isSensitiveFileBlocked(err) {
+				summary = "sensitive_file_blocked"
+				displayDetail = ""
+			}
 			if summary == "" {
 				summary = "tool failed"
 			}
@@ -552,6 +719,97 @@ func addTool(server *sdk.Server, base Dependencies, workspaceScoped bool, name, 
 		publish(deps.Events, events.Event{ToolCallID: toolCallID, Workspace: workspace, Type: events.EventToolCompleted, Tool: name, Summary: summary, Detail: displayDetail, Status: events.StatusComplete, Time: time.Now()})
 		return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: string(data)}}, StructuredContent: value}, nil
 	})
+}
+
+func selectCodexWorkspace(base Dependencies, raw json.RawMessage) (string, json.RawMessage, Dependencies, error) {
+	workspace, inner, err := splitWorkspace(raw)
+	if err != nil {
+		return "", nil, base, err
+	}
+	if !filepath.IsAbs(workspace) {
+		return "", nil, base, errs.New(errs.ErrInvalidInput, "workspace must be an absolute path", false)
+	}
+	requested := filepath.Clean(workspace)
+	if !base.Config.Yolo {
+		registered, err := config.LoadRegistry()
+		if err != nil {
+			return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace registry is unavailable", true)
+		}
+		found := false
+		for _, root := range registered {
+			if root == requested {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "", nil, base, errs.New(errs.ErrWorkspaceNotFound, "workspace is not registered", false)
+		}
+	}
+	canonical, err := filepath.EvalSymlinks(requested)
+	if err != nil || filepath.Clean(canonical) != requested {
+		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace is unavailable", true)
+	}
+	info, err := os.Stat(canonical)
+	if err != nil || !info.IsDir() {
+		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace is unavailable", true)
+	}
+	if !base.Config.Yolo {
+		selected, _, err := config.LoadWorkspace(canonical)
+		if err != nil {
+			return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace configuration is unavailable", true)
+		}
+		selected.Server = base.Config.Server
+		selected.Yolo = false
+		selected.Workspace.Root = canonical
+		if err := config.Validate(selected); err != nil {
+			return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace configuration is invalid", false)
+		}
+		base.Config = selected
+	}
+	base.Config.Workspace.Root = canonical
+	return canonical, inner, base, nil
+}
+
+func hasCodexThread(matches []codex.Session, threadID string) bool {
+	for _, match := range matches {
+		if strings.EqualFold(match.ThreadID, threadID) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeYOLOWorkspace(raw json.RawMessage, root string) (json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := decode(raw, &fields); err != nil {
+		return nil, errs.New(errs.ErrInvalidInput, "invalid tool arguments", false)
+	}
+
+	value, ok := fields["workspace"]
+	if !ok {
+		return raw, nil
+	}
+
+	var workspace string
+	if err := json.Unmarshal(value, &workspace); err != nil || strings.TrimSpace(workspace) == "" {
+		return nil, errs.New(errs.ErrInvalidInput, "workspace must be a non-empty string", false)
+	}
+	if !filepath.IsAbs(workspace) || filepath.Clean(workspace) != filepath.Clean(root) {
+		return nil, errs.New(errs.ErrInvalidInput, "workspace does not match the YOLO startup workspace", false)
+	}
+
+	copied := make(map[string]json.RawMessage, len(fields)-1)
+	for key, field := range fields {
+		if key != "workspace" {
+			copied[key] = field
+		}
+	}
+	normalized, err := json.Marshal(copied)
+	if err != nil {
+		return nil, errs.New(errs.ErrInvalidInput, "invalid tool arguments", false)
+	}
+	return normalized, nil
 }
 
 func workspaceSchema(schema any) map[string]any {
@@ -681,6 +939,11 @@ func isCancelled(err error) bool {
 		return typed.Code == errs.ErrCancelled
 	}
 	return false
+}
+
+func isSensitiveFileBlocked(err error) bool {
+	var typed errs.Error
+	return errors.As(err, &typed) && typed.Code == errs.ErrSensitiveFileBlocked
 }
 
 func isApprovalSettlement(err error) bool {

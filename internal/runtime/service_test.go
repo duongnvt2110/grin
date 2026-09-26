@@ -107,6 +107,18 @@ func TestRedactCommandRedactsAssignmentsWithoutChangingArguments(t *testing.T) {
 	}
 }
 
+func TestCodexQueueMessageIsRedactedFromCommandAndProcessText(t *testing.T) {
+	const message = "review this change\nPASSWORD=GRIN_TEST_SECRET"
+	command := RedactCommand("codex", []string{"queue", "--thread", "01a0717c-c5db-7fb2-92df-0ce116432122", "--message", message})
+	if command != "codex queue --thread 01a0717c-c5db-7fb2-92df-0ce116432122 --message <redacted>" {
+		t.Fatal("Codex queue command display did not redact its message")
+	}
+	process := redactProcessText("codex queue --thread 01a0717c-c5db-7fb2-92df-0ce116432122 --message review this change PASSWORD=GRIN_TEST_SECRET --model gpt-test")
+	if process != "codex queue --thread 01a0717c-c5db-7fb2-92df-0ce116432122 --message <redacted>" {
+		t.Fatal("flattened Codex process display did not redact the complete message tail")
+	}
+}
+
 func TestRedactProcessTextUsesBestEffortFlattenedFields(t *testing.T) {
 	got := redactProcessText("env FOO=hello world app")
 	want := "env FOO=<redacted> world app"
@@ -379,8 +391,8 @@ func TestProcessInspectionAndRedaction(t *testing.T) {
 	if err != nil || process.Process.PID != os.Getpid() {
 		t.Fatalf("process info = %+v, err=%v", process, err)
 	}
-	parsed := parseProcesses("12 user app app --token abc https://u:p@example.test")
-	if got := parsed[0].Command; strings.Contains(got, "abc") || strings.Contains(got, "u:p") {
+	parsed := parseProcesses("12 user app app --token abc https://u:p@example.test --message review this secret --model hidden")
+	if got := parsed[0].Command; strings.Contains(got, "abc") || strings.Contains(got, "u:p") || strings.Contains(got, "review this secret") || strings.Contains(got, "--model") || !strings.Contains(got, "--message <redacted>") {
 		t.Fatalf("process secrets were not redacted: %q", got)
 	}
 }

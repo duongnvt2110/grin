@@ -15,6 +15,9 @@ func TestNormalPolicyAppliesWorkspaceRules(t *testing.T) {
 		reason      string
 	}{
 		{name: "read", tool: "process.list", decision: Allow},
+		{name: "Codex discovery", tool: "codex.list", decision: Allow},
+		{name: "Codex result", tool: "codex.turn_result", decision: Allow},
+		{name: "Codex queue", tool: "codex.queue", decision: Allow, reason: "validated Codex thread queue"},
 		{name: "workspace write", tool: "fs.write_text", decision: Allow},
 		{name: "workspace edit", tool: "fs.edit_text", decision: Allow},
 		{name: "outside read", tool: "fs.read_text", outside: true, decision: Allow},
@@ -38,7 +41,7 @@ func TestNormalPolicyAppliesWorkspaceRules(t *testing.T) {
 }
 
 func TestYoloAllowsSupportedOperationsButNotUnknownTools(t *testing.T) {
-	for _, tool := range []string{"fs.write_text", "fs.edit_text", "git.status", "shell.run", "fs.read_text"} {
+	for _, tool := range []string{"fs.write_text", "fs.edit_text", "git.status", "shell.run", "fs.read_text", "codex.list", "codex.queue", "codex.turn_result"} {
 		if result := New(true).Evaluate(context.Background(), Operation{Tool: tool}); result.Decision != Allow {
 			t.Fatalf("YOLO %s decision = %s, want %s", tool, result.Decision, Allow)
 		}

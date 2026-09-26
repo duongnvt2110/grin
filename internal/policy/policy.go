@@ -52,6 +52,9 @@ func (e PolicyEvaluator) Evaluate(_ context.Context, operation Operation) Result
 	if operation.Tool == "shell.run" && operation.Outside {
 		return Result{Decision: Ask, Reason: "cwd outside workspace"}
 	}
+	if operation.Tool == "codex.queue" {
+		return Result{Decision: Allow, Reason: "validated Codex thread queue"}
+	}
 	if isWrite(operation.Tool) && operation.Outside {
 		return Result{Decision: Ask, Reason: "write outside workspace"}
 	}
@@ -69,7 +72,7 @@ func (e PolicyEvaluator) Evaluate(_ context.Context, operation Operation) Result
 
 func isReadOnly(tool string) bool {
 	switch tool {
-	case "fs.list", "fs.stat", "fs.read_text", "fs.search", "workspace.info", "process.list", "process.info", "system.info", "git.status", "git.diff", "git.log", "git.show":
+	case "fs.list", "fs.stat", "fs.read_text", "fs.search", "workspace.info", "workspace.list", "process.list", "process.info", "system.info", "git.status", "git.diff", "git.log", "git.show", "codex.list", "codex.turn_result":
 		return true
 	default:
 		return false
@@ -77,7 +80,7 @@ func isReadOnly(tool string) bool {
 }
 
 func isSideEffect(tool string) bool {
-	return isWrite(tool) || tool == "shell.run"
+	return isWrite(tool) || tool == "shell.run" || tool == "codex.queue"
 }
 
 func isWrite(tool string) bool {

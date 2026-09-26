@@ -14,6 +14,7 @@ const (
 	ErrExecutionTimeout     ErrorCode = "execution_timeout"
 	ErrCancelled            ErrorCode = "cancelled"
 	ErrOutputLimit          ErrorCode = "output_limit"
+	ErrSensitiveFileBlocked ErrorCode = "sensitive_file_blocked"
 	ErrFileExists           ErrorCode = "file_exists"
 	ErrRequestLimit         ErrorCode = "request_limit_exceeded"
 	ErrToolDisabled         ErrorCode = "tool_disabled"

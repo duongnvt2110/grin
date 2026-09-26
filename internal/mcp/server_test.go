@@ -16,12 +16,18 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"grin/internal/approval"
+	"grin/internal/codex"
 	"grin/internal/config"
 	"grin/internal/errs"
 	"grin/internal/events"
 	"grin/internal/filesystem"
 	"grin/internal/policy"
 	grinruntime "grin/internal/runtime"
+)
+
+const (
+	testThreadID  = "01a0717c-c5db-7fb2-92df-0ce116432122"
+	testRequestID = "01a0717c-c5db-7fb2-92df-0ce116432124"
 )
 
 func TestServerInstructionsAreExposedDuringInitialization(t *testing.T) {
@@ -37,11 +43,359 @@ func TestServerInstructionsAreExposedDuringInitialization(t *testing.T) {
 	if result == nil {
 		t.Fatal("initialize result is nil")
 	}
-	for _, want := range []string{"AGENTS.md", "fs.read_text", "fs.search", "before acting on the"} {
+	for _, want := range []string{"AGENTS.md", "fs.read_text", "fs.search", "codex.list", "codex.queue", "codex.turn_result", "QUEUE ONLY", "SINGLE REVIEW", "REVIEW LOOP", "continue checking the same request", "If the result is interrupted", "do not automatically\nqueue a replacement", "If the result is failed, stop, report the failure", "preserve\nworkspace/thread_id/request_id", "do not automatically queue another request", "If any result is interrupted", "break the automatic\nloop", "If any result is failed, break the automatic\nloop, report the failure, preserve workspace/thread_id/request_id", "and do not\nqueue the next review request", "Retry only after the user explicitly asks", "Resume only after the user explicitly asks to\ncontinue", "re-run\ncodex.list before queueing a fresh request", "back to Codex.", "First determine the target project\nfrom the task and conversation.", "workspace.list discovers\nregistered workspaces; it does not select the target for a task.", "Never choose a workspace just because it is the only or first result.", "determine the task's exact target workspace before\nsession discovery.", "Keep the exact\nworkspace and thread_id pair", "A successful codex.queue call alone", "manually resume", "READY_FOR_IMPLEMENT", "Do not generate, infer, or queue IMPLEMENT", "NO_MATERIAL_FINDINGS", "before acting on the"} {
 		if !strings.Contains(result.Instructions, want) {
 			t.Fatalf("server instructions missing %q: %s", want, result.Instructions)
 		}
 	}
+}
+
+func TestCodexToolsUseExplicitWorkspaceAndNormalRegistry(t *testing.T) {
+	session, server, fake, _, startup, target := newCodexMCPTest(t, false, nil)
+	defer session.Close()
+	defer server.Close()
+
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wanted := map[string]bool{"codex.list": false, "codex.queue": false, "codex.turn_result": false}
+	var workspaceListDescription string
+	for _, tool := range tools.Tools {
+		if tool.Name == "workspace.list" {
+			workspaceListDescription = tool.Description
+		}
+		if _, ok := wanted[tool.Name]; ok {
+			wanted[tool.Name] = true
+		}
+	}
+	if !strings.Contains(workspaceListDescription, "use this only when the task's exact target path cannot be established") || !strings.Contains(workspaceListDescription, "never choose the first or only result by default") {
+		t.Fatalf("workspace.list description does not treat results as task-matched candidates: %q", workspaceListDescription)
+	}
+	if strings.Contains(workspaceListDescription, "call this before any workspace-scoped tool") {
+		t.Fatalf("workspace.list description still mandates discovery before target resolution: %q", workspaceListDescription)
+	}
+	for name, found := range wanted {
+		if !found {
+			t.Fatalf("Codex MCP tool %q was not registered", name)
+		}
+	}
+
+	missing, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "codex.list", Arguments: map[string]any{}})
+	if err != nil || !missing.IsError || !strings.Contains(missing.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceRequired)) {
+		t.Fatalf("codex.list without workspace = %+v, err=%v", missing, err)
+	}
+	if len(fake.listCalls) != 0 {
+		t.Fatal("codex.list reached the service without a selected workspace")
+	}
+
+	unregistered, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "codex.list", Arguments: workspaceArgs(startup, map[string]any{})})
+	if err != nil || !unregistered.IsError || !strings.Contains(unregistered.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceNotFound)) {
+		t.Fatalf("codex.list for an unregistered workspace = %+v, err=%v", unregistered, err)
+	}
+	if len(fake.listCalls) != 0 {
+		t.Fatal("unregistered workspace reached the Codex service")
+	}
+
+	listed, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "codex.list", Arguments: workspaceArgs(target, map[string]any{})})
+	if err != nil || listed.IsError || !strings.Contains(listed.Content[0].(*sdk.TextContent).Text, testThreadID) {
+		t.Fatalf("codex.list for registered workspace = %+v, err=%v", listed, err)
+	}
+	if len(fake.listCalls) != 1 || fake.listCalls[0] != target {
+		t.Fatalf("Codex list workspace calls = %v, want %q", fake.listCalls, target)
+	}
+}
+
+func TestCodexToolsInYoloCanTargetOutsideStartupRoot(t *testing.T) {
+	session, server, fake, bus, startup, target := newCodexMCPTest(t, true, nil)
+	defer session.Close()
+	defer server.Close()
+
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "codex.list", Arguments: workspaceArgs(target, map[string]any{})})
+	if err != nil || result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, target) {
+		t.Fatalf("YOLO codex.list target = %+v, err=%v", result, err)
+	}
+	if len(fake.listCalls) != 1 || fake.listCalls[0] != target || fake.listCalls[0] == startup {
+		t.Fatalf("YOLO target workspace calls = %v", fake.listCalls)
+	}
+	foundTargetEvent := false
+	for _, event := range bus.Snapshot() {
+		if event.Tool == "codex.list" && event.Workspace == target {
+			foundTargetEvent = true
+		}
+	}
+	if !foundTargetEvent {
+		t.Fatal("Codex lifecycle events omitted the explicitly selected YOLO workspace")
+	}
+}
+
+func TestCodexTurnResultUsesWorkspaceLimitsOnlyInNormalMode(t *testing.T) {
+	const targetLimit = 321
+	for _, test := range []struct {
+		name string
+		yolo bool
+		want int64
+	}{
+		{name: "normal uses target workspace limit", want: targetLimit},
+		{name: "yolo keeps startup limit", yolo: true, want: config.Defaults().Limits.MaxShellStdoutBytes},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session, server, fake, _, _, target := newCodexMCPTest(t, test.yolo, nil)
+			defer session.Close()
+			defer server.Close()
+
+			configDir := filepath.Join(target, ".grin")
+			if err := os.MkdirAll(configDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			workspaceConfig := []byte("version: 1\nlimits:\n  max_shell_stdout_bytes: 321\n")
+			if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), workspaceConfig, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fake.turnResult = codex.TurnResult{Status: codex.TurnPending}
+
+			result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+				Name:      "codex.turn_result",
+				Arguments: workspaceArgs(target, map[string]any{"thread_id": testThreadID, "request_id": testRequestID}),
+			})
+			if err != nil || result.IsError {
+				t.Fatalf("codex.turn_result = %+v, err=%v", result, err)
+			}
+			if fake.resultLimit != test.want {
+				t.Fatalf("Codex result limit = %d, want %d", fake.resultLimit, test.want)
+			}
+		})
+	}
+}
+
+func TestCodexQueueDoesNotExposeMessageInEventsOrResult(t *testing.T) {
+	session, server, fake, bus, _, target := newCodexMCPTest(t, false, nil)
+	defer session.Close()
+	defer server.Close()
+	const message = "GRIN_CODEX_PRIVATE_REVIEW_MESSAGE_7F91C"
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name:      "codex.queue",
+		Arguments: workspaceArgs(target, map[string]any{"thread_id": testThreadID, "message": message}),
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("codex.queue = %+v, err=%v", result, err)
+	}
+	if !fake.queued || fake.queuedMessage != message || fake.queuedThread != testThreadID {
+		t.Fatal("Codex service did not receive the explicitly approved queue request")
+	}
+	encoded, err := json.Marshal(result.StructuredContent)
+	if err != nil || strings.Contains(string(encoded), message) {
+		t.Fatal("codex.queue response exposed the queued message")
+	}
+	for _, event := range bus.Snapshot() {
+		if event.Tool == "codex.queue" && (strings.Contains(event.Summary, message) || strings.Contains(event.Detail, message)) {
+			t.Fatal("Codex lifecycle event exposed the queued message")
+		}
+		if event.Tool == "codex.queue" && event.Workspace != target {
+			t.Fatal("Codex lifecycle event omitted the selected workspace")
+		}
+	}
+}
+
+func TestCodexQueuePolicyDenialDoesNotQueue(t *testing.T) {
+	session, server, fake, _, _, target := newCodexMCPTest(t, false, denyCodexQueue{})
+	defer session.Close()
+	defer server.Close()
+
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name:      "codex.queue",
+		Arguments: workspaceArgs(target, map[string]any{"thread_id": testThreadID, "message": "review"}),
+	})
+	if err != nil || !result.IsError || fake.queued {
+		t.Fatal("denied Codex queue unexpectedly executed")
+	}
+}
+
+func TestCodexQueueApprovalRejectionAndCancellationDoNotQueue(t *testing.T) {
+	for _, outcome := range []string{"reject", "cancel"} {
+		t.Run(outcome, func(t *testing.T) {
+			target := t.TempDir()
+			registerTestWorkspace(t, target)
+			cfg := config.Defaults()
+			cfg.Workspace.Root = target
+			files, err := filesystem.New(target, cfg.Limits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bus := events.New(20)
+			reliable := bus.SubscribeReliable()
+			defer reliable.Close()
+			manager := approval.New(bus, time.Second)
+			fake := &fakeCodexTools{}
+			httpServer := httptest.NewServer(Handler(NewServer(Dependencies{
+				Filesystem: files,
+				Codex:      fake,
+				Config:     cfg,
+				Version:    "test",
+				Events:     bus,
+				Approval:   manager,
+				Policy:     askCodexQueue{},
+			})))
+			defer httpServer.Close()
+			client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+			session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+
+			resultChannel := make(chan *sdk.CallToolResult, 1)
+			errorChannel := make(chan error, 1)
+			go func() {
+				result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{
+					Name:      "codex.queue",
+					Arguments: workspaceArgs(target, map[string]any{"thread_id": testThreadID, "message": "review"}),
+				})
+				resultChannel <- result
+				errorChannel <- callErr
+			}()
+			event := waitForApprovalEvent(t, reliable.Events)
+			if outcome == "reject" {
+				err = manager.Resolve(approval.ApprovalDecision{ApprovalRequestID: event.ApprovalRequestID, OperationDigest: event.OperationDigest, Outcome: events.ApprovalRejected})
+			} else {
+				err = manager.Cancel(event.ApprovalRequestID, event.OperationDigest)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := <-resultChannel
+			if callErr := <-errorChannel; callErr != nil || result == nil || !result.IsError || fake.queued {
+				t.Fatal("rejected or cancelled Codex queue executed")
+			}
+		})
+	}
+}
+
+func TestCodexTurnResultReturnsPendingForSameRequestCorrelation(t *testing.T) {
+	session, server, fake, bus, _, target := newCodexMCPTest(t, false, nil)
+	defer session.Close()
+	defer server.Close()
+	fake.turnResult = codex.TurnResult{Status: codex.TurnPending}
+
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name:      "codex.turn_result",
+		Arguments: workspaceArgs(target, map[string]any{"thread_id": testThreadID, "request_id": testRequestID}),
+	})
+	if err != nil || result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, `"status":"pending"`) {
+		t.Fatalf("pending Codex result = %+v, err=%v", result, err)
+	}
+	if len(fake.resultCalls) != 1 || fake.resultCalls[0] != target+"|"+testThreadID+"|"+testRequestID {
+		t.Fatal("Codex result lookup did not preserve exact request correlation")
+	}
+	const finalText = "GRIN_CODEX_FINAL_REVIEW_TEXT_7F91C"
+	fake.turnResult = codex.TurnResult{Status: codex.TurnCompleted, Text: finalText}
+	completed, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name:      "codex.turn_result",
+		Arguments: workspaceArgs(target, map[string]any{"thread_id": testThreadID, "request_id": testRequestID}),
+	})
+	if err != nil || completed.IsError || !strings.Contains(completed.Content[0].(*sdk.TextContent).Text, finalText) {
+		t.Fatal("completed Codex result did not return the final text")
+	}
+	for _, event := range bus.Snapshot() {
+		if event.Tool == "codex.turn_result" && (strings.Contains(event.Summary, finalText) || strings.Contains(event.Detail, finalText)) {
+			t.Fatal("Codex lifecycle event included result content")
+		}
+	}
+}
+
+type fakeCodexTools struct {
+	listCalls     []string
+	queued        bool
+	queuedThread  string
+	queuedMessage string
+	turnResult    codex.TurnResult
+	resultCalls   []string
+	resultLimit   int64
+}
+
+func (f *fakeCodexTools) List(_ context.Context, workspace string) (codex.ListResult, error) {
+	f.listCalls = append(f.listCalls, workspace)
+	return codex.ListResult{Workspace: workspace, Running: true, Matches: []codex.Session{{PID: 42, ThreadID: testThreadID}}}, nil
+}
+
+func (f *fakeCodexTools) Queue(_ context.Context, _, threadID, message string) (codex.QueueResult, error) {
+	f.queued = true
+	f.queuedThread = threadID
+	f.queuedMessage = message
+	return codex.QueueResult{ThreadID: threadID, RequestID: testRequestID}, nil
+}
+
+func (f *fakeCodexTools) TurnResult(_ context.Context, workspace, threadID, requestID string, maxBytes int64) (codex.TurnResult, error) {
+	f.resultCalls = append(f.resultCalls, workspace+"|"+threadID+"|"+requestID)
+	f.resultLimit = maxBytes
+	return f.turnResult, nil
+}
+
+type denyCodexQueue struct{}
+
+func (denyCodexQueue) Evaluate(_ context.Context, operation policy.Operation) policy.Result {
+	if operation.Tool == "codex.queue" {
+		return policy.Result{Decision: policy.Deny, Reason: "test denial"}
+	}
+	return policy.Result{Decision: policy.Allow, Reason: "test allow"}
+}
+
+type askCodexQueue struct{}
+
+func (askCodexQueue) Evaluate(_ context.Context, operation policy.Operation) policy.Result {
+	if operation.Tool == "codex.queue" {
+		return policy.Result{Decision: policy.Ask, Reason: "test approval"}
+	}
+	return policy.Result{Decision: policy.Allow, Reason: "test allow"}
+}
+
+func newCodexMCPTest(t *testing.T, yolo bool, evaluator policy.Evaluator) (*sdk.ClientSession, *httptest.Server, *fakeCodexTools, *events.Bus, string, string) {
+	t.Helper()
+	startup := t.TempDir()
+	target := t.TempDir()
+	if !yolo {
+		registerTestWorkspace(t, target)
+	}
+	cfg := config.Defaults()
+	cfg.Yolo = yolo
+	cfg.Workspace.Root = startup
+	files, err := filesystem.New(startup, cfg.Limits, yolo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := events.New(20)
+	fake := &fakeCodexTools{}
+	if evaluator == nil {
+		evaluator = policy.New(yolo)
+	}
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{
+		Filesystem: files,
+		Codex:      fake,
+		Config:     cfg,
+		Version:    "test",
+		Events:     bus,
+		Policy:     evaluator,
+	})))
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{
+		Endpoint:             httpServer.URL,
+		HTTPClient:           httpServer.Client(),
+		MaxRetries:           -1,
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		httpServer.Close()
+		t.Fatal(err)
+	}
+	canonicalStartup, err := filepath.EvalSymlinks(startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session, httpServer, fake, bus, canonicalStartup, canonicalTarget
 }
 
 func TestNormalModeRequiresWorkspaceAndListsRegistry(t *testing.T) {
@@ -350,6 +704,156 @@ func TestStreamableHTTPReadTextRedactsSensitiveContent(t *testing.T) {
 	}
 }
 
+func TestStreamableHTTPReadTextBlocksSensitiveFile(t *testing.T) {
+	root := t.TempDir()
+	registerTestWorkspace(t, root)
+	outside := t.TempDir()
+	const secret = "GRIN_BLOCKED_SECRET_7F91C"
+	path := filepath.Join(outside, ".env")
+	if err := os.WriteFile(path, []byte("PASSWORD="+secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Defaults()
+	cfg.Workspace.Root = root
+	files, err := filesystem.New(root, cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := events.New(10)
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{
+		Filesystem: files,
+		Config:     cfg,
+		Version:    "test",
+		Events:     bus,
+		Policy:     policy.New(false),
+	})))
+	defer httpServer.Close()
+
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{
+		Endpoint:             httpServer.URL,
+		HTTPClient:           httpServer.Client(),
+		MaxRetries:           -1,
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name: "fs.read_text",
+		Arguments: workspaceArgs(root, map[string]any{
+			"path": path,
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || len(result.Content) == 0 {
+		t.Fatalf("unexpected fs.read_text result: %+v", result)
+	}
+	text := result.Content[0].(*sdk.TextContent).Text
+	if strings.Contains(text, secret) || !strings.Contains(text, string(errs.ErrSensitiveFileBlocked)) {
+		t.Fatalf("unsafe blocked-read response: %s", text)
+	}
+	structured, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(structured), secret) {
+		t.Fatal("StructuredContent leaked the blocked-read sentinel")
+	}
+
+	var failed bool
+	for _, event := range bus.Snapshot() {
+		if event.Type == events.EventApprovalRequired {
+			t.Fatal("sensitive outside-workspace read requested approval")
+		}
+		if event.Type == events.EventToolFailed {
+			failed = true
+			if event.Summary != "sensitive_file_blocked" || event.Detail != "" {
+				t.Fatalf("unsafe blocked-read lifecycle event: %+v", event)
+			}
+		}
+		if strings.Contains(event.Summary, secret) || strings.Contains(event.Detail, secret) {
+			t.Fatalf("lifecycle event leaked the blocked-read sentinel: %+v", event)
+		}
+	}
+	if !failed {
+		t.Fatal("blocked read did not publish a failure lifecycle event")
+	}
+}
+
+func TestStreamableHTTPReadTextBlocksCanonicalSensitiveFileBeforeApproval(t *testing.T) {
+	root := t.TempDir()
+	registerTestWorkspace(t, root)
+	outside := t.TempDir()
+	const secret = "GRIN_BLOCKED_CANONICAL_SECRET_7F91C"
+	target := filepath.Join(outside, ".env")
+	if err := os.WriteFile(target, []byte("PASSWORD="+secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(outside, "safe.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	cfg := config.Defaults()
+	cfg.Workspace.Root = root
+	files, err := filesystem.New(root, cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := events.New(10)
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{
+		Filesystem: files,
+		Config:     cfg,
+		Version:    "test",
+		Events:     bus,
+		Policy:     policy.New(false),
+	})))
+	defer httpServer.Close()
+
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{
+		Endpoint:             httpServer.URL,
+		HTTPClient:           httpServer.Client(),
+		MaxRetries:           -1,
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name: "fs.read_text",
+		Arguments: workspaceArgs(root, map[string]any{
+			"path": link,
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || len(result.Content) == 0 {
+		t.Fatalf("unexpected fs.read_text result: %+v", result)
+	}
+	text := result.Content[0].(*sdk.TextContent).Text
+	if strings.Contains(text, secret) || !strings.Contains(text, string(errs.ErrSensitiveFileBlocked)) {
+		t.Fatalf("unsafe canonical blocked-read response: %s", text)
+	}
+	for _, event := range bus.Snapshot() {
+		if event.Type == events.EventApprovalRequired {
+			t.Fatal("canonical sensitive outside-workspace read requested approval")
+		}
+		if strings.Contains(event.Summary, secret) || strings.Contains(event.Detail, secret) {
+			t.Fatalf("lifecycle event leaked the canonical blocked-read sentinel: %+v", event)
+		}
+	}
+}
+
 func TestStreamableHTTPReadWorkflow(t *testing.T) {
 	root := t.TempDir()
 	registerTestWorkspace(t, root)
@@ -384,8 +888,8 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 16 {
-		t.Fatalf("expected sixteen normal-mode tools, got %d", len(tools.Tools))
+	if len(tools.Tools) != 19 {
+		t.Fatalf("expected nineteen normal-mode tools, got %d", len(tools.Tools))
 	}
 	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(root, map[string]any{"path": "note.txt"})})
 	if err != nil {
@@ -820,10 +1324,19 @@ func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	foundWorkspaceList := false
 	for _, tool := range tools.Tools {
 		if tool.Name == "workspace.list" {
-			t.Fatal("YOLO unexpectedly registered workspace.list")
+			foundWorkspaceList = true
 		}
+	}
+	if !foundWorkspaceList {
+		t.Fatal("YOLO did not register workspace.list compatibility tool")
+	}
+
+	listed, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.list", Arguments: map[string]any{}})
+	if err != nil || listed.IsError || !strings.Contains(listed.Content[0].(*sdk.TextContent).Text, root) {
+		t.Fatalf("YOLO workspace.list = %+v, err=%v", listed, err)
 	}
 
 	infoResult, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.info", Arguments: map[string]any{}})
@@ -833,6 +1346,29 @@ func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 	info, ok := infoResult.StructuredContent.(map[string]any)
 	if !ok || info["yolo"] != true {
 		t.Fatalf("workspace.info = %#v", infoResult.StructuredContent)
+	}
+
+	legacyInfo, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.info", Arguments: workspaceArgs(root, map[string]any{})})
+	if err != nil || legacyInfo.IsError {
+		t.Fatalf("YOLO legacy workspace.info = %+v, err=%v", legacyInfo, err)
+	}
+
+	notePath := filepath.Join(root, "note.txt")
+	if err := os.WriteFile(notePath, []byte("yolo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyRead, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(root, map[string]any{"path": "note.txt"})})
+	if err != nil || legacyRead.IsError {
+		t.Fatalf("YOLO legacy fs.read_text = %+v, err=%v", legacyRead, err)
+	}
+
+	rejectedPath := filepath.Join(outside, "rejected.txt")
+	mismatched, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: workspaceArgs(outside, map[string]any{"path": rejectedPath, "content": "must not write"})})
+	if err != nil || !mismatched.IsError || !strings.Contains(mismatched.Content[0].(*sdk.TextContent).Text, string(errs.ErrInvalidInput)) {
+		t.Fatalf("YOLO mismatched workspace = %+v, err=%v", mismatched, err)
+	}
+	if _, err := os.Stat(rejectedPath); !os.IsNotExist(err) {
+		t.Fatalf("mismatched workspace created %q, stat err=%v", rejectedPath, err)
 	}
 
 	for _, call := range []struct {

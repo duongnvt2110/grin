@@ -4,7 +4,8 @@ This page explains how Grin is arranged at runtime, which state is global, and
 how one MCP server safely routes requests to multiple local workspaces.
 
 For installation, start with the [README](../README.md). For the complete
-ChatGPT connection tutorial, use [onboarding](onboarding.md).
+ChatGPT connection tutorial, use [onboarding](onboarding.md). For the practical
+ChatGPT ↔ Codex workflow, use the [Codex review guide](codex-review.md).
 
 ## System overview
 
@@ -25,21 +26,21 @@ ONE Grin MCP server
         │     process.info
         │     system.info
         │
-        └── workspace-scoped tools
-              workspace.info
-              fs.*
-              git.*
-              shell.run
+        ├── workspace-scoped tools
+        │     workspace.info / fs.* / git.* / shell.run
+        │           ↓
+        │     workspace selector → registered canonical path
+        │           ↓
+        │     selected workspace services → policy/approval/execute → TUI
+
+        └── Codex review tools
+              codex.list / codex.queue / codex.turn_result
                     ↓
-             workspace selector
+          explicit workspace (Normal: registered;
+                              YOLO: existing target)
                     ↓
-            exact registry match
-                    ↓
-          selected workspace services
-                    ↓
-            policy / approval / execute
-                    ↓
-                   TUI
+          live-thread discovery / queued request /
+             exact persisted result lookup (~/.codex only)
 ```
 
 Grin does not create one MCP server per repository. It keeps one stable tool
@@ -60,6 +61,7 @@ catalog and selects the workspace on each normal-mode scoped request.
 | Filesystem service | Performs bounded list/stat/read/search/write/edit behavior rooted at one workspace. |
 | Runtime service | Runs bounded commands and process/system inspection with timeout, cleanup, and redaction behavior. |
 | Git service | Performs bounded read-only Git status/diff/log/show for one supported repository root. |
+| Codex service | Discovers live top-level threads, queues to an exact thread, and reads its correlated result from the default local Codex history. It stores no conversation or thread-selection state. |
 | Event bus | Carries request, policy, approval, completion, failure, and workspace display context to the TUI. |
 | TUI | Shows request lifecycle rows and local approval actions. |
 
@@ -76,6 +78,7 @@ This distinction is important in multi-workspace mode:
 | Workspace limits/shell settings | Selected `<workspace>/.grin/config.yaml` | Request | Root-bound execution behavior for that request |
 | Filesystem/runtime/Git services | Request dependency copy | Request | Execution against exactly one selected workspace |
 | Conversation workspace | ChatGPT conversation | Client-side conversation context | Which workspace path ChatGPT sends on later scoped calls |
+| Codex thread selection/request ID | ChatGPT conversation and Codex history | Client-side selection / persisted Codex history | Which live thread to queue and which exact result to retrieve |
 
 Grin intentionally stores no conversation-to-workspace mapping and has no
 mutable server-side `current workspace`.
@@ -110,7 +113,7 @@ require non-empty absolute workspace
   ↓
 read ~/.grin/config.yaml
   ↓
-exact path registered?
+registered workspace?
   ├─ no  → workspace_not_found
   └─ yes
        ↓
@@ -148,24 +151,33 @@ never mutated globally.
 
 ## YOLO flow
 
-YOLO deliberately does **not** use multi-workspace routing:
+Filesystem, Git, and shell tools in YOLO deliberately keep the single startup
+workspace. Codex review tools instead require an explicit existing target
+workspace and do not apply that startup-root restriction:
 
 ```text
 grin --workspace /repo/a --yolo
         ↓
-one startup workspace / existing tool schemas
+filesystem / Git / shell tools use one startup workspace
         ↓
-no workspace.list
-no required workspace selector
-no registry routing
+workspace.list returns the startup workspace for compatibility
+no selector or registry routing for filesystem / Git / shell tools
         ↓
 relative paths/default cwd/Git use /repo/a as their base
         ↓
 workspace containment and Grin approval restrictions are bypassed
 ```
 
+Codex tools remain explicitly workspace-scoped in YOLO mode and can target an
+existing directory outside the startup workspace.
+
 OS permissions, input validation, limits, timeout/cancellation, cleanup, and
 runtime correctness checks still apply.
+
+The Codex service inspects only live top-level sessions for discovery/queueing.
+Result lookup uses the default local `~/.codex` state and history files after
+validating the stored workspace; Grin keeps no thread mapping or review-loop
+state.
 
 See the [mode table in the README](../README.md#modes) for the user-facing
 comparison.

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"grin/internal/approval"
+	"grin/internal/codex"
 	"grin/internal/config"
 	"grin/internal/events"
 	"grin/internal/filesystem"
@@ -41,10 +42,11 @@ func New(cfg config.Config, version string) (*Application, error) {
 		return nil, err
 	}
 	gitService := gringit.New(runtimeService, files.Root())
+	codexService := codex.New()
 	bus := events.New(cfg.Limits.EventBufferSize)
 	approvalManager := approval.New(bus, cfg.Limits.ApprovalTimeout)
 	readiness := tui.NewReadiness()
-	mcpServer := grinmcp.NewServer(grinmcp.Dependencies{Filesystem: files, Runtime: runtimeService, Git: gitService, Config: cfg, Version: version, Events: bus, Approval: approvalManager, Policy: policy.New(cfg.Yolo)})
+	mcpServer := grinmcp.NewServer(grinmcp.Dependencies{Filesystem: files, Runtime: runtimeService, Git: gitService, Codex: codexService, Config: cfg, Version: version, Events: bus, Approval: approvalManager, Policy: policy.New(cfg.Yolo)})
 	application := &Application{Config: cfg, bus: bus, approval: approvalManager, readiness: readiness, input: os.Stdin, output: os.Stdout}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", grinmcp.Handler(mcpServer))

@@ -60,6 +60,10 @@ func redactProcessFields(fields []string) []string {
 			redactNext = false
 			continue
 		}
+		if strings.EqualFold(field, "--message") {
+			redacted = append(redacted, "--message", "<redacted>")
+			break
+		}
 		if match := assignmentPattern.FindStringSubmatch(field); match != nil {
 			redacted = append(redacted, match[1]+"=<redacted>")
 			continue

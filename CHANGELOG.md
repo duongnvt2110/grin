@@ -6,6 +6,27 @@ All notable Grin changes are documented here.
 
 No unreleased changes yet.
 
+## 0.3.0 - 2026-09-26
+
+### Added
+
+- Codex MCP tools to find live sessions, queue messages to an exact thread, and
+  retrieve the result for a specific request.
+- A Codex review guide covering queue-only requests, single reviews, review
+  loops, workspace selection, and manual resume.
+
+### Improved
+
+- Codex results and filesystem reads share credential redaction; Codex message
+  text is hidden from process displays.
+- Workspace routing validates explicit canonical targets, with compatible
+  workspace discovery behavior in YOLO mode.
+
+### Fixed
+
+- Blocks reads of common credential and private-key files, and blocks private
+  key material found in text files or Codex results.
+
 ## 0.2.1 - 2026-09-15
 
 ### Fixed

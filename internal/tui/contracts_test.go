@@ -417,3 +417,25 @@ func TestYoloHeaderIsVisible(t *testing.T) {
 		t.Fatalf("YOLO header missing: %s", view)
 	}
 }
+
+func TestSensitiveReadFailureRendersOnlySafeLifecycleData(t *testing.T) {
+	model := NewModel("/workspace", "normal", nil)
+	model.Width = 100
+	model.Height = 8
+	updated, _ := model.Update(EventMsg{Event: events.Event{
+		ID:         "blocked-read",
+		ToolCallID: "tool-blocked-read",
+		Type:       events.EventToolFailed,
+		Tool:       "fs.read_text",
+		Summary:    "sensitive_file_blocked",
+	}})
+	model = updated.(Model)
+
+	view := model.View().Content
+	if !strings.Contains(view, "sensitive_file_blocked") {
+		t.Fatalf("safe blocked-read summary missing: %s", view)
+	}
+	if strings.Contains(view, "GRIN_BLOCKED_SECRET") {
+		t.Fatal("TUI rendered a secret sentinel")
+	}
+}

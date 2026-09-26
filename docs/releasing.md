@@ -3,7 +3,7 @@
 This repository publishes macOS and Linux binaries through GitHub Actions and
 GoReleaser OSS. A release is created when a tag matching `v*` is pushed.
 
-## Before the first release
+## Before each release
 
 Confirm that:
 
@@ -27,14 +27,8 @@ go test ./...
 go test -race ./...
 go vet ./...
 go mod verify
-go build -buildvcs=false ./cmd/grin
-```
-
-Remove any temporary root binary after the build if it is not intended for the
-repository:
-
-```zsh
-rm -f ./grin
+BUILD_DIR=$(mktemp -d)
+go build -buildvcs=false -o "$BUILD_DIR/grin" ./cmd/grin
 ```
 
 ## Publish a release

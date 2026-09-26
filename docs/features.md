@@ -9,9 +9,10 @@ implementation. For installation and CLI usage, start with the
 | Behavior | Normal mode | `--yolo` |
 | --- | --- | --- |
 | Workspace model | Multiple registered workspaces | One startup workspace |
-| `workspace.list` | Available | Not registered |
-| Workspace selector on scoped tools | Required | Not required |
-| Registry routing | Exact registered path | Not used |
+| `workspace.list` | Available | Available for compatibility; returns the startup workspace |
+| Workspace selector on filesystem/Git/shell tools | Required | Not required |
+| Workspace on Codex tools | Required; must be registered | Required; any existing target |
+| Registry routing | Registered canonical path after lexical cleaning | Not used |
 | Per-workspace configuration | Loaded for each selected request | Startup workspace configuration |
 | Grin policy/approval | Active | Bypassed for supported tools |
 | Workspace containment | Active according to normal policy | Bypassed |
@@ -25,14 +26,64 @@ Normal mode is the default and recommended mode.
 
 | Tool | Purpose | Normal | YOLO |
 | --- | --- | --- | --- |
-| `workspace.list` | Return registered canonical workspaces | Yes | No |
+| `workspace.list` | Return registered canonical workspaces, or the YOLO startup workspace for compatibility | Yes | Yes |
 | `process.list` | Return bounded/redacted process metadata | Yes | Yes |
 | `process.info` | Inspect one process with bounded/redacted metadata | Yes | Yes |
 | `system.info` | Return non-secret OS/system information | Yes | Yes |
 
+### Codex review tools
+
+For normal usage, start with the
+[step-by-step Codex review guide](codex-review.md). This section is
+the capability and boundary reference.
+
+| Tool | Purpose |
+| --- | --- |
+| `codex.list` | Find currently running top-level Codex threads for one explicit workspace. |
+| `codex.queue` | Send a message to one exact live thread and return a `request_id`. |
+| `codex.turn_result` | Read the exact persisted turn correlated with that `request_id`. |
+
+All three tools require an explicit absolute workspace.
+
+- **Normal mode:** the lexically cleaned path must match a registered canonical
+  workspace; symlink aliases are rejected.
+- **YOLO mode:** any existing absolute workspace may be used for Codex tools.
+- Live-session discovery currently supports macOS only.
+- Grin requires the Codex CLI and `sqlite3` locally.
+- Result lookup supports the default `~/.codex` data root only.
+
+Grin never guesses a Codex thread or falls back to the latest result. If
+multiple live threads match, the caller must choose one. If the workspace
+changes, call `codex.list` again.
+
+ChatGPT can use these tools in three ways: **Queue Only**, **Single Review**, or
+**Review Loop**. These are client-side behaviors; Grin stores no review-mode
+state. If a waited-for Codex turn returns `failed` or `interrupted`, Single
+Review and Review Loop stop instead of automatically queueing a replacement.
+Human retry or continue revalidates the live thread with `codex.list` and uses
+a fresh `codex.queue` request with a new `request_id`.
+
+Review Loop has two authorization phases:
+
+```text
+before explicit IMPLEMENT
+  review/reconcile only
+  → READY_FOR_IMPLEMENT
+
+after explicit IMPLEMENT
+  implement approved scope
+  → ChatGPT independently reviews
+  → NO_MATERIAL_FINDINGS
+```
+
+Queued message content is omitted from Grin lifecycle/TUI summaries. Returned
+final text is bounded, credential-redacted, and blocked if it contains
+private-key material. A same-user operating-system process inspection may still
+briefly see the Codex CLI `--message` argument.
+
 ### Workspace-scoped tools
 
-In normal mode these require an exact registered `workspace` argument.
+In normal mode these require a registered absolute `workspace` argument.
 
 | Area | Tools | Capability |
 | --- | --- | --- |
@@ -52,7 +103,8 @@ selected workspace.
 
 | Class | Tools | Effect |
 | --- | --- | --- |
-| Discovery | `workspace.list` | Reads the normal-mode workspace registry before any workspace is selected. |
+| Discovery/compatibility | `workspace.list` | Reads the normal-mode registry, or returns the YOLO startup workspace without routing. |
+| Codex session | `codex.list`, `codex.queue`, `codex.turn_result` | Targets an explicit workspace and exact Codex thread/request; does not store conversation state. |
 | Workspace read | `workspace.info` | Reads selected-workspace metadata. |
 | Filesystem read | `fs.list`, `fs.stat`, `fs.read_text`, `fs.search` | Reads or searches filesystem content/metadata. |
 | Git read | `git.status`, `git.diff`, `git.log`, `git.show` | Reads repository state/history; never writes Git state. |
@@ -76,6 +128,8 @@ workspace and approval restrictions for supported tools.
 | Operation | Location | Normal mode |
 | --- | --- | --- |
 | `workspace.info` | selected workspace | ALLOW |
+| `codex.list`, `codex.turn_result` | validated explicit workspace | ALLOW |
+| `codex.queue` | validated registered workspace and live thread | ALLOW |
 | `git.*` | selected workspace | ALLOW |
 | `process.*`, `system.info` | host/global | ALLOW |
 | `fs.list/stat/read_text/search` | inside selected workspace | Execute after validation; no policy decision on this path |
@@ -139,10 +193,22 @@ YOLO does **not** make unsupported tools valid and does not bypass operating
 system permissions, input validation, output/resource limits, cancellation, or
 process cleanup.
 
+`workspace.list` remains available in YOLO only for conversations that cached
+the normal-mode tool catalog. It returns the configured startup workspace and
+does not enable multi-workspace routing. A stale `workspace` argument is
+accepted only when it matches that startup root.
+
+Codex tools are the exception to YOLO's single-startup-workspace tool routing:
+they require an explicit target workspace and may target another existing
+workspace. They still use live-thread matching and the default `~/.codex`
+history boundary.
+
 ## Workspace routing
 
 `grin init` registers canonical workspace paths in `~/.grin/config.yaml`.
-Normal-mode scoped tool calls must use one of those exact paths.
+Normal-mode scoped tool calls must use an absolute path that, after lexical
+cleaning, matches one of those registered canonical paths. Symlink aliases are
+rejected.
 
 Grin does not:
 
@@ -174,10 +240,15 @@ validation, output/resource limits, cancellation, or process cleanup.
 
 ## Filesystem boundaries
 
-- `fs.read_text` redacts recognized sensitive standalone assignments and
-  supported `user:password@host` URL credentials before returning content.
-- Matching is conservative and key-name based; this is not a complete secret
-  scanner. `fs.search`, Git output, and shell output are outside this feature.
+- `fs.read_text` blocks common credential/private-key files and private-key
+  content before returning it.
+- Ordinary text reads redact recognized sensitive assignments, simple JSON
+  fields, and supported `user:password@host` URL credentials before returning
+  content.
+- Matching is conservative and is not a complete secret scanner. `fs.search`,
+  Git output, and shell output are outside this feature.
+- Codex review results use the shared text redactor and output limit; private
+  key material is blocked rather than returned.
 - `fs.edit_text` replaces one exact text occurrence.
 - Existing permission bits are preserved for supported text edits.
 - Oversized or ambiguous edits are rejected.
