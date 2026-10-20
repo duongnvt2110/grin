@@ -47,6 +47,45 @@ func TestRequestFailsClosedWithoutReliableDelivery(t *testing.T) {
 	}
 }
 
+type closedResolutionPublisher struct {
+	required chan struct{}
+}
+
+func (p closedResolutionPublisher) PublishReliable(_ context.Context, event events.Event) error {
+	if event.Type == events.EventApprovalResolved {
+		return context.Canceled
+	}
+	p.required <- struct{}{}
+	return nil
+}
+
+func TestAllowedApprovalFailsClosedWhenResolutionDeliveryFails(t *testing.T) {
+	publisher := closedResolutionPublisher{required: make(chan struct{}, 1)}
+	manager := New(publisher, time.Second)
+	request := testRequest(t)
+	result := make(chan error, 1)
+	go func() {
+		_, err := manager.Request(context.Background(), request)
+		result <- err
+	}()
+	select {
+	case <-publisher.required:
+	case <-time.After(time.Second):
+		t.Fatal("approval request was not delivered")
+	}
+	if err := manager.Resolve(ApprovalDecision{ApprovalRequestID: request.ID, OperationDigest: request.OperationDigest, Outcome: events.ApprovalAllowed}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if got := errorCode(err); got != errs.ErrApprovalUnavailable {
+			t.Fatalf("approval resolved without reliable delivery: code=%s, want %s", got, errs.ErrApprovalUnavailable)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval request did not fail closed")
+	}
+}
+
 func TestApprovalIsBoundToDigestAndConsumedOnce(t *testing.T) {
 	bus := events.New(4)
 	reliable := bus.SubscribeReliable()

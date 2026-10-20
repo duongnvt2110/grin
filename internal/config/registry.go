@@ -93,7 +93,14 @@ func InitializeWorkspace(root string) (string, error) {
 	}
 	legacy := fmt.Sprintf("version: %d\n", defaults.Version)
 	localPath := filepath.Join(canonical, WorkspaceConfigPath)
-	_, err = os.Stat(localPath)
+	configDirInfo, dirErr := os.Lstat(filepath.Dir(localPath))
+	if dirErr == nil && configDirInfo.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("workspace config directory must not be a symlink")
+	}
+	if dirErr != nil && !os.IsNotExist(dirErr) {
+		return "", fmt.Errorf("inspect workspace config directory: %w", dirErr)
+	}
+	localInfo, err := os.Lstat(localPath)
 	switch {
 	case os.IsNotExist(err):
 		if err := os.MkdirAll(filepath.Dir(localPath), 0o700); err != nil {
@@ -105,6 +112,9 @@ func InitializeWorkspace(root string) (string, error) {
 	case err != nil:
 		return "", fmt.Errorf("inspect workspace config: %w", err)
 	default:
+		if localInfo.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("workspace config file must not be a symlink")
+		}
 		existing, err := os.ReadFile(localPath)
 		if err != nil {
 			return "", fmt.Errorf("read workspace config: %w", err)

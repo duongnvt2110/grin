@@ -2,9 +2,47 @@
 
 All notable Grin changes are documented here.
 
-## Unreleased
+## 0.4.0 - 2026-10-20
 
-No unreleased changes yet.
+### Added
+
+- Cross-platform, read-only `grin codex discover` with macOS terminal
+  AppleScript observations, Linux X11/scoped-tmux discovery, and Windows
+  top-level window title observations. Discovery reports evidence and remains
+  `UNRESOLVED` when the currently displayed Codex TUI cannot be verified.
+- A macOS Automation permission guide for Ghostty, Terminal.app, and iTerm2
+  discovery, plus updated Codex review and troubleshooting documentation.
+- Apache License, Version 2.0, for Grin's open-source distribution.
+
+### Changed
+
+- Replaced the old `codex.list` MCP tool with fresh recipient discovery in
+  `codex.queue`. Eligible title-derived candidates require explicit human
+  selection of the exact thread UUID; Grin fails closed rather than selecting
+  an `UNRESOLVED` candidate automatically.
+- Codex queueing uses the local app-server, resuming a validated thread only
+  when needed; `codex.turn_result` remains correlated to the exact request.
+
+### Fixed
+
+- Hardened `fs.search` to avoid opening nonregular/FIFO entries, skip
+  sensitive files and private-key material, and redact recognized secrets.
+- Rejected symlink-based local workspace configuration paths during
+  initialization.
+- Fixed reliable approval-event shutdown races and ensured failed delivery
+  cannot be acknowledged as successful approval.
+- Drained command stdout and stderr before process wait to avoid losing
+  output under concurrent pipe activity.
+
+### Compatibility
+
+- Removed the `codex.list` MCP endpoint. Existing clients must use
+  `codex.queue` to discover candidates and select an explicit thread ID.
+- Removed the unused `limits.max_concurrent_requests` YAML option.
+  Existing workspace configurations containing it must delete the key;
+  Grin now rejects that unsupported setting rather than ignoring it.
+- Refresh the ChatGPT Grin connector after upgrading if it continues to
+  advertise a stale MCP tool schema.
 
 ## 0.3.0 - 2026-09-26
 

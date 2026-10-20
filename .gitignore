@@ -10,6 +10,7 @@ coverage.html
 
 # Local agent/runtime state
 /.agent-harness/
+/.grin/
 /tmp/
 /dist/
 

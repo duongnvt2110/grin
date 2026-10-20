@@ -24,8 +24,6 @@ jobs:
       - run: go mod verify
       - run: test "$(go list -m -f '{{.Version}}' github.com/modelcontextprotocol/go-sdk)" = 'v1.7.0'
       - run: test "$(go list -m -f '{{.Version}}' charm.land/bubbletea/v2)" = 'v2.0.9'
-      - run: test "$(go list -m -f '{{.Version}}' charm.land/bubbles/v2)" = 'v2.2.1'
-      - run: test "$(go list -m -f '{{.Version}}' charm.land/lipgloss/v2)" = 'v2.0.6'
       - run: test "$(go list -m -f '{{.Version}}' gopkg.in/yaml.v3)" = 'v3.0.1'
       - run: go run ./cmd/grin --version
       - run: go run ./cmd/grin --help

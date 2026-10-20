@@ -54,7 +54,6 @@ type Limits struct {
 	DefaultShellTimeout time.Duration `yaml:"default_shell_timeout"`
 	MaxShellTimeout     time.Duration `yaml:"max_shell_timeout"`
 	MaxProcesses        int           `yaml:"max_processes"`
-	MaxConcurrent       int           `yaml:"max_concurrent_requests"`
 	ApprovalTimeout     time.Duration `yaml:"approval_timeout"`
 	EventBufferSize     int           `yaml:"event_buffer_size"`
 }
@@ -80,8 +79,7 @@ func Defaults() Config {
 			MaxSearchDuration: 30 * time.Second, MaxListEntries: 500,
 			MaxShellStdoutBytes: 1048576, MaxShellStderrBytes: 1048576,
 			DefaultShellTimeout: 30 * time.Second, MaxShellTimeout: 5 * time.Minute,
-			MaxProcesses:  256,
-			MaxConcurrent: 8, ApprovalTimeout: 5 * time.Minute, EventBufferSize: 1000,
+			MaxProcesses: 256, ApprovalTimeout: 5 * time.Minute, EventBufferSize: 1000,
 		},
 		Shell: Shell{AllowedEnvironment: []string{"PATH", "LANG", "LC_ALL"}},
 		TUI:   TUI{Mode: "inline", MaxEvents: 1000},
@@ -136,21 +134,6 @@ func Parse(args []string) (Options, error) {
 	return Options{Config: cfg}, nil
 }
 
-func Load(path string) (Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Config{}, err
-	}
-	cfg, err := decodeConfig(data)
-	if err != nil {
-		return Config{}, err
-	}
-	if err := Validate(cfg); err != nil {
-		return Config{}, err
-	}
-	return cfg, nil
-}
-
 func FindWorkspaceRoot(start string) (string, bool, error) {
 	dir, err := canonicalDirectory(start)
 	if err != nil {
@@ -200,12 +183,18 @@ func decodeConfig(data []byte) (Config, error) {
 		Policy *struct {
 			Profile *string `yaml:"profile"`
 		} `yaml:"policy"`
+		Limits *struct {
+			RemovedConcurrencyLimit yaml.Node `yaml:"max_concurrent_requests"`
+		} `yaml:"limits"`
 	}
 	if err := yaml.Unmarshal(data, &legacy); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 	if legacy.Policy != nil && legacy.Policy.Profile != nil {
 		return Config{}, errors.New("parse config: policy.profile is no longer supported; Grin now has only normal and --yolo modes; remove the policy section from .grin/config.yaml")
+	}
+	if legacy.Limits != nil && legacy.Limits.RemovedConcurrencyLimit.Kind != 0 {
+		return Config{}, errors.New("parse config: limits.max_concurrent_requests is no longer supported; remove it from .grin/config.yaml")
 	}
 
 	cfg := Defaults()

@@ -7,10 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -48,15 +45,43 @@ shell tools. Codex tools always require an explicit workspace: Normal mode
 requires a registered workspace, while YOLO may target any existing absolute
 workspace.
 
-For Codex review work, determine the task's exact target workspace before
-session discovery. Call codex.list with that workspace only; never use a
-workspace.list result as the target merely because it is the only result. Use
-only threads returned for that exact workspace. If none match, tell the user to
-open Codex there; if multiple match, ask which thread to use. Keep the exact
-workspace and thread_id pair for follow-up requests in the same review. Before
-queueing, use that same workspace/thread pair. On workspace change, discard
-the old thread selection and call codex.list for the new exact workspace. Do
-not use shell.run to drive normal Codex review work.
+For Codex requests, codex.queue performs fresh, read-only discovery inside
+Grin on every send, including sends with a supplied thread_id. Do not reuse a
+thread_id remembered from a previous standalone task. The optional command
+grin codex discover --workspace <exact-workspace> can show terminal candidates
+without driving terminal input or queuing a message.
+
+Discovery returns thread-ID candidates, titles, terminal identities,
+workspace comparisons, and eligibility corroborated by local Codex app-server metadata.
+For every new standalone send or review without a UUID explicitly named by
+the user, call codex.queue with message and omit thread_id. Title-derived
+candidates remain UNRESOLVED, so Grin never auto-selects them, even when there
+is only one eligible candidate. Eligible candidates that pass ambiguity checks
+return selection_required with no message queued. Show those candidates (thread
+title, shortened ID, and terminal identity) and ask the user which one to select; then
+call codex.queue again with the selected full UUID. If none is eligible or
+discovery is unavailable or identity is ambiguous, stop without sending. Never
+select by result order, recency, window foreground, or terminal focus.
+Supply thread_id only when the user explicitly names/selects it for this task
+or as a follow-up in the same uninterrupted review loop. Even supplied UUIDs
+must still match a fresh eligible discovery result before queueing.
+
+Title-derived candidates remain UNRESOLVED because native APIs do not prove
+freshness across /new, /clear, or /resume. A user's explicit candidate choice
+designates a task recipient, not proof of the currently displayed TUI. If the
+user specifically requests proof of the currently displayed TUI, require its
+exact Session ID from /status in that TUI or independent identity evidence.
+Selection alone does not authorize sending a message or implementing code. If
+the user already asked to send a report and is now selecting its recipient,
+the earlier send authorization remains applicable; no duplicate authorization
+is needed.
+Reuse the exact selected UUID for follow-ups in the same uninterrupted
+review loop, without asking again, but let Grin validate it against fresh
+discovery on every queue request. Keep each request_id paired with the returned
+thread_id for codex.turn_result. Never reuse a recipient from an earlier
+standalone task. The server enforces technical eligibility and a fresh
+candidate match; the MCP client remains responsible for respecting the
+human's explicit choice when multiple recipients exist.
 
 Codex review supports three behaviors:
 
@@ -72,12 +97,16 @@ inProgress, continue checking the same request; do not queue a duplicate. When
 completed, independently review the Codex result once, present the assessment
 to the user, and stop. If the result is interrupted, stop, report the
 interruption, preserve workspace/thread_id/request_id, and do not automatically
-queue a replacement. Retry only after the user explicitly asks; re-run
-codex.list before queueing a fresh request. Do not automatically send findings
+queue a replacement. Retry only after the user explicitly asks. For an
+explicit-thread review, reuse the same exact thread_id for a retry of that
+request. For a current-TUI request, rerun grin codex discover and require an exact
+thread ID from the user or independent proof if it remains unresolved. Do not automatically send findings
 back to Codex. If the result is failed, stop, report the failure, preserve
 workspace/thread_id/request_id, and do not automatically queue another request.
-Retry only after the user explicitly asks; re-run codex.list before queueing a
-fresh request.
+Retry only after the user explicitly asks. For an explicit-thread review,
+reuse the same exact thread_id for a retry of that request. For a current-TUI
+request, rerun grin codex discover; do not queue an
+unresolved candidate.
 
 REVIEW LOOP: use this only when the user explicitly asks to start/continue a
 review loop, review until no material findings remain, or reach a named loop
@@ -89,7 +118,9 @@ loop, report the interruption, preserve workspace/thread_id/request_id, and do
 not queue the next review request. If any result is failed, break the automatic
 loop, report the failure, preserve workspace/thread_id/request_id, and do not
 queue the next review request. Resume only after the user explicitly asks to
-continue; re-run codex.list before queueing a fresh request. Before the user
+continue. For an explicit-thread review, reuse the same exact thread_id for
+this review loop. For a current-TUI review loop, keep using the exact thread
+UUID selected for that loop; do not ask again or switch recipients. Before the user
 explicitly says IMPLEMENT, Codex work is review/reconciliation only and the
 loop stops at READY_FOR_IMPLEMENT. Do not generate, infer, or queue IMPLEMENT;
 wait for the user's explicit command. Only after that command may Codex modify
@@ -125,9 +156,69 @@ type Dependencies struct {
 }
 
 type codexTools interface {
-	List(context.Context, string) (codex.ListResult, error)
+	Discover(context.Context, string) (codex.DiscoveryResult, error)
 	Queue(context.Context, string, string, string) (codex.QueueResult, error)
 	TurnResult(context.Context, string, string, string, int64) (codex.TurnResult, error)
+}
+
+type codexRecipientOption struct {
+	ThreadID    string `json:"thread_id"`
+	ThreadTitle string `json:"thread_title,omitempty"`
+	TerminalID  string `json:"terminal_id,omitempty"`
+}
+
+// selectFreshCodexRecipient intentionally does not use persisted user choices
+// or a previous request's thread ID. The caller performs discovery on every
+// queue call, including when the user supplied a thread ID explicitly.
+func selectFreshCodexRecipient(fresh codex.DiscoveryResult, requested string) (string, []codexRecipientOption, error) {
+	options := make([]codexRecipientOption, 0, len(fresh.Candidates))
+	seen := make(map[string]bool)
+	unverified := make([]codex.ThreadCandidate, 0)
+	if fresh.Status != "UNSUPPORTED" {
+		for _, candidate := range fresh.Candidates {
+			if candidate.WorkspaceMatch == "no" || candidate.TopLevel == "no" || candidate.Resolution == "archived_title" {
+				continue
+			}
+			if candidate.ThreadID == "" || candidate.TopLevel != "yes" ||
+				(candidate.WorkspaceMatch != "yes" && candidate.WorkspaceMatch != "state_only") ||
+				(candidate.Resolution != "title_uuid_correlated" && candidate.Resolution != "unique_workspace_match") {
+				unverified = append(unverified, candidate)
+				continue
+			}
+			id := strings.ToLower(candidate.ThreadID)
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			options = append(options, codexRecipientOption{
+				ThreadID: id, ThreadTitle: candidate.ThreadTitle, TerminalID: candidate.ID,
+			})
+		}
+	}
+	if requested != "" {
+		for _, option := range options {
+			if strings.EqualFold(option.ThreadID, requested) {
+				return option.ThreadID, nil, nil
+			}
+		}
+		return "", nil, errs.New(errs.ErrNotFound, "supplied Codex thread is absent from fresh eligible discovery; no message queued", false)
+	}
+	switch len(options) {
+	case 0:
+		return "", nil, errs.New(errs.ErrNotFound, "fresh discovery found no eligible Codex threads; no message queued", false)
+	case 1:
+		for _, candidate := range unverified {
+			if candidate.ThreadID == "" || !strings.EqualFold(candidate.ThreadID, options[0].ThreadID) {
+				return "", nil, errs.New(errs.ErrUnsupported, "another Codex terminal has unverified thread identity; automatic send was stopped", false)
+			}
+		}
+		if fresh.Status == "UNRESOLVED" {
+			return "", options, nil
+		}
+		return options[0].ThreadID, nil, nil
+	default:
+		return "", options, nil
+	}
 }
 
 func NewServer(deps Dependencies) *sdk.Server {
@@ -135,413 +226,13 @@ func NewServer(deps Dependencies) *sdk.Server {
 		Instructions: serverInstructions,
 		Capabilities: &sdk.ServerCapabilities{},
 	})
-	addTool(server, deps, true, "workspace.info", "Return metadata for the selected workspace. In normal mode, provide the exact workspace argument. This is not a discovery or selection tool; use workspace.list when the workspace path is unknown.", map[string]any{"type": "object", "additionalProperties": false}, func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input emptyInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid workspace.info arguments", false)
-		}
-		if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "workspace.info", Capability: "workspace.inspect", Arguments: input}, "inspect workspace", "selected workspace metadata", approval.RiskLow); err != nil {
-			return nil, err
-		}
-		return toolResult{Value: deps.Filesystem.Info(), Summary: "selected workspace"}, nil
-	})
-	addTool(server, deps, false, "workspace.list", "Discover registered Grin workspaces. In normal mode, use this only when the task's exact target path cannot be established from the task or conversation; treat results as candidates matching the task, and never choose the first or only result by default. In YOLO mode, it returns the configured startup workspace for compatibility and does not enable routing.", objectSchema(map[string]any{}), func(_ context.Context, deps Dependencies, _ string, raw json.RawMessage) (any, error) {
-		var input emptyInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid workspace.list arguments", false)
-		}
-		if deps.Config.Yolo {
-			return toolResult{Value: map[string]any{"workspaces": []string{deps.Filesystem.Root()}}, Summary: "list workspaces"}, nil
-		}
-		workspaces, err := config.LoadRegistry()
-		if err != nil {
-			return nil, errs.New(errs.ErrWorkspaceUnavailable, "workspace registry is unavailable", true)
-		}
-		return toolResult{Value: map[string]any{"workspaces": workspaces}, Summary: "list workspaces"}, nil
-	})
-	addTool(server, deps, false, "codex.list", "Find currently running top-level Codex sessions for an explicit workspace. Normal mode requires a registered workspace; YOLO accepts any existing absolute workspace.", objectSchema(map[string]any{}), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input emptyInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid codex.list arguments", false)
-		}
-		if deps.Codex == nil {
-			return nil, errs.New(errs.ErrUnsupported, "Codex tools are unavailable", false)
-		}
-		workspace := deps.Config.Workspace.Root
-		operation := policy.Operation{Tool: "codex.list", Capability: "codex.inspect", Arguments: map[string]string{"workspace": workspace}}
-		if err := authorize(ctx, deps, toolCallID, operation, "list Codex sessions", "workspace: "+workspace, approval.RiskLow); err != nil {
-			return nil, err
-		}
-		result, err := deps.Codex.List(ctx, workspace)
-		if err != nil {
-			return nil, err
-		}
-		return toolResult{Value: result, Summary: "Codex sessions listed"}, nil
-	})
-	addTool(server, deps, false, "codex.queue", "Queue a message to an exact currently running Codex thread. A successful response means accepted for queueing, not that execution has started.", objectSchema(map[string]any{
-		"thread_id": map[string]any{"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36},
-		"message":   map[string]any{"type": "string", "minLength": 1},
-	}, "thread_id", "message"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input struct {
-			ThreadID string `json:"thread_id"`
-			Message  string `json:"message"`
-		}
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid codex.queue arguments", false)
-		}
-		if deps.Codex == nil {
-			return nil, errs.New(errs.ErrUnsupported, "Codex tools are unavailable", false)
-		}
-		workspace := deps.Config.Workspace.Root
-		live, err := deps.Codex.List(ctx, workspace)
-		if err != nil {
-			return nil, err
-		}
-		if !live.Running || !hasCodexThread(live.Matches, input.ThreadID) {
-			return nil, errs.New(errs.ErrNotFound, "the requested Codex thread is not running in this workspace", false)
-		}
-		operation := policy.Operation{Tool: "codex.queue", Capability: "codex.queue", Arguments: map[string]string{"thread_id": input.ThreadID}}
-		if err := authorize(ctx, deps, toolCallID, operation, "queue Codex review", "thread: "+input.ThreadID, approval.RiskLow); err != nil {
-			return nil, err
-		}
-		result, err := deps.Codex.Queue(ctx, workspace, input.ThreadID, input.Message)
-		if err != nil {
-			return nil, err
-		}
-		return toolResult{Value: result, Summary: "Codex request accepted: " + result.RequestID}, nil
-	})
-	addTool(server, deps, false, "codex.turn_result", "Read the exact Codex turn associated with a request ID. Pending results can be retried with the same IDs.", objectSchema(map[string]any{
-		"thread_id":  map[string]any{"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36},
-		"request_id": map[string]any{"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36},
-	}, "thread_id", "request_id"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input struct {
-			ThreadID  string `json:"thread_id"`
-			RequestID string `json:"request_id"`
-		}
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid codex.turn_result arguments", false)
-		}
-		if deps.Codex == nil {
-			return nil, errs.New(errs.ErrUnsupported, "Codex tools are unavailable", false)
-		}
-		workspace := deps.Config.Workspace.Root
-		operation := policy.Operation{Tool: "codex.turn_result", Capability: "codex.history.read", Arguments: map[string]string{"thread_id": input.ThreadID, "request_id": input.RequestID}}
-		if err := authorize(ctx, deps, toolCallID, operation, "read Codex result", "thread: "+input.ThreadID, approval.RiskLow); err != nil {
-			return nil, err
-		}
-		result, err := deps.Codex.TurnResult(ctx, workspace, input.ThreadID, input.RequestID, deps.Config.Limits.MaxShellStdoutBytes)
-		if err != nil {
-			return nil, err
-		}
-		summary := "Codex turn " + result.Status
-		return toolResult{Value: result, Summary: summary}, nil
-	})
-	addTool(server, deps, true, "fs.list", "List bounded entries subject to the active Grin policy.", objectSchema(map[string]any{
-		"path":        map[string]any{"type": "string"},
-		"depth":       map[string]any{"type": "integer", "minimum": 0},
-		"max_entries": map[string]any{"type": "integer", "minimum": 1},
-	}), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input filesystem.ListInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid fs.list arguments", false)
-		}
-		outside, err := deps.Filesystem.ClassifyExisting(input.Path)
-		if err != nil {
-			return nil, err
-		}
-		if outside {
-			if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.list", Capability: "filesystem.read", Arguments: input, Outside: true}, "list "+displayPath(input.Path), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
-				return nil, err
-			}
-		}
-		output, err := deps.Filesystem.List(ctx, input, outside)
-		if err != nil {
-			return nil, err
-		}
-		return toolResult{Value: output, Summary: displayPath(output.Path)}, nil
-	})
-	addTool(server, deps, true, "fs.stat", "Return bounded metadata for a path subject to the active Grin policy.", objectSchema(map[string]any{
-		"path": map[string]any{"type": "string"},
-	}, "path"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input filesystem.StatInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid fs.stat arguments", false)
-		}
-		outside, err := deps.Filesystem.ClassifyExisting(input.Path)
-		if err != nil {
-			return nil, err
-		}
-		if outside {
-			if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.stat", Capability: "filesystem.read", Arguments: input, Outside: true}, "stat "+displayPath(input.Path), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
-				return nil, err
-			}
-		}
-		output, err := deps.Filesystem.Stat(ctx, input, outside)
-		if err != nil {
-			return nil, err
-		}
-		return toolResult{Value: output, Summary: displayPath(output.Path)}, nil
-	})
-	addTool(server, deps, true, "fs.read_text", "Read a bounded text file subject to the active Grin policy.", objectSchema(map[string]any{
-		"path":      map[string]any{"type": "string"},
-		"max_bytes": map[string]any{"type": "integer", "minimum": 1},
-	}, "path"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input filesystem.ReadInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid fs.read_text arguments", false)
-		}
-		outside, err := deps.Filesystem.ClassifyReadText(input.Path)
-		if err != nil {
-			return nil, err
-		}
-		if outside {
-			if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.read_text", Capability: "filesystem.read", Arguments: input, Outside: true}, "read "+displayPath(input.Path), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
-				return nil, err
-			}
-		}
-		output, err := deps.Filesystem.ReadText(ctx, input, outside)
-		if err != nil {
-			return nil, err
-		}
-		return toolResult{Value: output, Summary: displayPath(output.Path)}, nil
-	})
-	addTool(server, deps, true, "fs.search", "Search bounded text and file names subject to the active Grin policy.", objectSchema(map[string]any{
-		"path":        map[string]any{"type": "string"},
-		"query":       map[string]any{"type": "string"},
-		"max_results": map[string]any{"type": "integer", "minimum": 1},
-	}, "query"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input filesystem.SearchInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid fs.search arguments", false)
-		}
-		outside, err := deps.Filesystem.ClassifyExisting(input.Path)
-		if err != nil {
-			return nil, err
-		}
-		if outside {
-			if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.search", Capability: "filesystem.read", Arguments: input, Outside: true}, "search "+displayText(input.Query), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
-				return nil, err
-			}
-		}
-		output, err := deps.Filesystem.Search(ctx, input, outside)
-		return toolResult{Value: output, Summary: searchSummary(input.Query, input.Path)}, err
-	})
-	addTool(server, deps, true, "fs.write_text", "Write bounded text subject to the active Grin policy.", objectSchema(map[string]any{
-		"path":      map[string]any{"type": "string"},
-		"content":   map[string]any{"type": "string"},
-		"overwrite": map[string]any{"type": "boolean"},
-	}, "path", "content"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input filesystem.WriteInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid fs.write_text arguments", false)
-		}
-		if err := deps.Filesystem.ValidateWrite(input); err != nil {
-			return nil, err
-		}
-		outside, err := deps.Filesystem.ClassifyCreate(input.Path)
-		if err != nil {
-			return nil, err
-		}
-		operation := policy.Operation{Tool: "fs.write_text", Capability: "filesystem.write", Arguments: input, Outside: outside}
-		if err := authorize(ctx, deps, toolCallID, operation, "write "+input.Path, "content omitted", approval.RiskHigh); err != nil {
-			return nil, err
-		}
-		output, err := deps.Filesystem.WriteText(ctx, input, outside)
-		if err != nil {
-			return nil, err
-		}
-		return toolResult{Value: output, Summary: displayPath(output.Path)}, nil
-	})
-	addTool(server, deps, true, "fs.edit_text", "Replace one exact text occurrence subject to the active Grin policy.", objectSchema(map[string]any{
-		"path":     map[string]any{"type": "string"},
-		"old_text": map[string]any{"type": "string"},
-		"new_text": map[string]any{"type": "string"},
-	}, "path", "old_text", "new_text"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input filesystem.EditTextInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid fs.edit_text arguments", false)
-		}
-		if err := deps.Filesystem.ValidateEdit(input); err != nil {
-			return nil, err
-		}
-		outside, err := deps.Filesystem.ClassifyExisting(input.Path)
-		if err != nil {
-			return nil, err
-		}
-		operation := policy.Operation{Tool: "fs.edit_text", Capability: "filesystem.write", Arguments: input, Outside: outside}
-		if err := authorize(ctx, deps, toolCallID, operation, "edit "+displayPath(input.Path), "content omitted", approval.RiskHigh); err != nil {
-			return nil, err
-		}
-		output, err := deps.Filesystem.EditText(ctx, input, outside)
-		return toolResult{Value: output, Summary: "edit " + displayPath(input.Path)}, err
-	})
-	addTool(server, deps, true, "shell.run", "Run one bounded executable subject to the active Grin policy.", objectSchema(map[string]any{
-		"command":    map[string]any{"type": "string", "minLength": 1},
-		"args":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-		"cwd":        map[string]any{"type": "string"},
-		"timeout_ms": map[string]any{"type": "integer", "minimum": 0},
-	}, "command"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input shellRunInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid shell.run arguments", false)
-		}
-		if strings.TrimSpace(input.Command) == "" || input.TimeoutMS < 0 || input.TimeoutMS > math.MaxInt64/int64(time.Millisecond) {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid shell.run command or timeout", false)
-		}
-		if deps.Runtime == nil {
-			return nil, errs.New(errs.ErrUnsupported, "runtime is unavailable", false)
-		}
-		outside, err := deps.Runtime.ClassifyCwd(input.Cwd)
-		if err != nil {
-			return nil, err
-		}
-		destructive := grinruntime.IsDestructiveCommand(input.Command, input.Args)
-		operation := policy.Operation{Tool: "shell.run", Capability: "shell.execute", Arguments: input, Outside: outside, Destructive: destructive}
-		detail := fmt.Sprintf("command: %s\ncwd: %s", grinruntime.RedactCommand(input.Command, input.Args), input.Cwd)
-		if err := authorize(ctx, deps, toolCallID, operation, grinruntime.RedactCommand(input.Command, input.Args), detail, approval.RiskHigh); err != nil {
-			return nil, err
-		}
-		result, err := deps.Runtime.RunCommand(ctx, grinruntime.RunCommandRequest{Executable: input.Command, Args: input.Args, Cwd: input.Cwd, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond, AllowOutside: outside})
-		if err != nil {
-			return nil, err
-		}
-		return toolResult{Value: result, Summary: displayText(grinruntime.RedactCommand(input.Command, input.Args)), Detail: detail}, nil
-	})
-	addTool(server, deps, false, "process.list", "List bounded, redacted process metadata.", objectSchema(map[string]any{}), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input emptyInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid process.list arguments", false)
-		}
-		if deps.Runtime == nil {
-			return nil, errs.New(errs.ErrUnsupported, "runtime is unavailable", false)
-		}
-		if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "process.list", Capability: "process.inspect", Arguments: input}, "list processes", "bounded process metadata; command secrets are redacted", approval.RiskLow); err != nil {
-			return nil, err
-		}
-		output, err := deps.Runtime.ListProcesses(ctx, grinruntime.ListProcessesRequest{})
-		if err != nil {
-			return nil, err
-		}
-		return toolResult{Value: output, Summary: "list processes"}, nil
-	})
-	addTool(server, deps, false, "process.info", "Return bounded, redacted metadata for one process.", objectSchema(map[string]any{
-		"pid": map[string]any{"type": "integer", "minimum": 1},
-	}, "pid"), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input processInfoInput
-		if err := decode(raw, &input); err != nil || input.PID <= 0 {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid process.info arguments", false)
-		}
-		if deps.Runtime == nil {
-			return nil, errs.New(errs.ErrUnsupported, "runtime is unavailable", false)
-		}
-		if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "process.info", Capability: "process.inspect", Arguments: input}, fmt.Sprintf("inspect process %d", input.PID), "bounded process metadata; command secrets are redacted", approval.RiskLow); err != nil {
-			return nil, err
-		}
-		output, err := deps.Runtime.ProcessInfo(ctx, grinruntime.ProcessInfoRequest{PID: input.PID})
-		if err != nil {
-			return nil, err
-		}
-		return toolResult{Value: output, Summary: fmt.Sprintf("process %d", input.PID)}, nil
-	})
-	addTool(server, deps, false, "system.info", "Return non-secret system information.", objectSchema(map[string]any{}), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input emptyInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid system.info arguments", false)
-		}
-		if deps.Runtime == nil {
-			return nil, errs.New(errs.ErrUnsupported, "runtime is unavailable", false)
-		}
-		if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "system.info", Capability: "system.inspect", Arguments: input}, "inspect system", "OS and architecture only; no environment values", approval.RiskLow); err != nil {
-			return nil, err
-		}
-		output, err := deps.Runtime.SystemInfo(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return toolResult{Value: output, Summary: "inspect system"}, nil
-	})
-	addTool(server, deps, true, "git.status", "Return bounded Git status for the workspace repository.", objectSchema(map[string]any{}), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input emptyInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid git.status arguments", false)
-		}
-		if deps.Git == nil {
-			return nil, errs.New(errs.ErrUnsupported, "Git is unavailable", false)
-		}
-		operation := policy.Operation{Tool: "git.status", Capability: "git.read", Arguments: input}
-		if err := authorize(ctx, deps, toolCallID, operation, "git status", "workspace Git status", approval.RiskLow); err != nil {
-			return nil, err
-		}
-		output, err := deps.Git.Status(ctx)
-		return toolResult{Value: output, Summary: "git status"}, err
-	})
-	addTool(server, deps, true, "git.diff", "Return bounded Git diff for the workspace repository.", objectSchema(map[string]any{
-		"staged": map[string]any{"type": "boolean"},
-		"path":   map[string]any{"type": "string"},
-	}), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input gringit.DiffInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid git.diff arguments", false)
-		}
-		if err := gringit.ValidateDiffInput(input); err != nil {
-			return nil, err
-		}
-		if deps.Git == nil {
-			return nil, errs.New(errs.ErrUnsupported, "Git is unavailable", false)
-		}
-		operation := policy.Operation{Tool: "git.diff", Capability: "git.read", Arguments: input}
-		if err := authorize(ctx, deps, toolCallID, operation, "git diff", "workspace Git diff", approval.RiskLow); err != nil {
-			return nil, err
-		}
-		output, err := deps.Git.Diff(ctx, input)
-		return toolResult{Value: output, Summary: "git diff"}, err
-	})
-	addTool(server, deps, true, "git.log", "Return bounded Git history for the workspace repository.", objectSchema(map[string]any{
-		"max_entries": map[string]any{"type": "integer", "minimum": 0, "maximum": 100},
-	}), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input gringit.LogInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid git.log arguments", false)
-		}
-		if _, err := gringit.NormalizeLogInput(input); err != nil {
-			return nil, err
-		}
-		if deps.Git == nil {
-			return nil, errs.New(errs.ErrUnsupported, "Git is unavailable", false)
-		}
-		operation := policy.Operation{Tool: "git.log", Capability: "git.read", Arguments: input}
-		if err := authorize(ctx, deps, toolCallID, operation, "git log", "workspace Git history", approval.RiskLow); err != nil {
-			return nil, err
-		}
-		output, err := deps.Git.Log(ctx, input)
-		return toolResult{Value: output, Summary: "git log"}, err
-	})
-	addTool(server, deps, true, "git.show", "Return bounded Git revision content for the workspace repository.", objectSchema(map[string]any{
-		"revision": map[string]any{"type": "string"},
-		"path":     map[string]any{"type": "string"},
-	}), func(ctx context.Context, deps Dependencies, toolCallID string, raw json.RawMessage) (any, error) {
-		var input gringit.ShowInput
-		if err := decode(raw, &input); err != nil {
-			return nil, errs.New(errs.ErrInvalidInput, "invalid git.show arguments", false)
-		}
-		normalized, err := gringit.NormalizeShowInput(input)
-		if err != nil {
-			return nil, err
-		}
-		if deps.Git == nil {
-			return nil, errs.New(errs.ErrUnsupported, "Git is unavailable", false)
-		}
-		operation := policy.Operation{Tool: "git.show", Capability: "git.read", Arguments: normalized}
-		summary := "git show " + displayText(normalized.Revision)
-		if normalized.Path != "" {
-			summary += " " + displayPath(normalized.Path)
-		}
-		if err := authorize(ctx, deps, toolCallID, operation, summary, "workspace Git revision", approval.RiskLow); err != nil {
-			return nil, err
-		}
-		output, err := deps.Git.Show(ctx, normalized)
-		return toolResult{Value: output, Summary: summary}, err
-	})
+
+	registerWorkspaceTools(server, deps)
+	registerCodexTools(server, deps)
+	registerFilesystemTools(server, deps)
+	registerRuntimeTools(server, deps)
+	registerGitTools(server, deps)
+
 	return server
 }
 
@@ -643,7 +334,7 @@ func isWorkspaceScopedTool(name string) bool {
 }
 
 func isCodexTool(name string) bool {
-	return name == "codex.list" || name == "codex.queue" || name == "codex.turn_result"
+	return name == "codex.queue" || name == "codex.turn_result"
 }
 
 type rawToolHandler func(context.Context, Dependencies, string, json.RawMessage) (any, error)
@@ -719,201 +410,6 @@ func addTool(server *sdk.Server, base Dependencies, workspaceScoped bool, name, 
 		publish(deps.Events, events.Event{ToolCallID: toolCallID, Workspace: workspace, Type: events.EventToolCompleted, Tool: name, Summary: summary, Detail: displayDetail, Status: events.StatusComplete, Time: time.Now()})
 		return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: string(data)}}, StructuredContent: value}, nil
 	})
-}
-
-func selectCodexWorkspace(base Dependencies, raw json.RawMessage) (string, json.RawMessage, Dependencies, error) {
-	workspace, inner, err := splitWorkspace(raw)
-	if err != nil {
-		return "", nil, base, err
-	}
-	if !filepath.IsAbs(workspace) {
-		return "", nil, base, errs.New(errs.ErrInvalidInput, "workspace must be an absolute path", false)
-	}
-	requested := filepath.Clean(workspace)
-	if !base.Config.Yolo {
-		registered, err := config.LoadRegistry()
-		if err != nil {
-			return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace registry is unavailable", true)
-		}
-		found := false
-		for _, root := range registered {
-			if root == requested {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return "", nil, base, errs.New(errs.ErrWorkspaceNotFound, "workspace is not registered", false)
-		}
-	}
-	canonical, err := filepath.EvalSymlinks(requested)
-	if err != nil || filepath.Clean(canonical) != requested {
-		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace is unavailable", true)
-	}
-	info, err := os.Stat(canonical)
-	if err != nil || !info.IsDir() {
-		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace is unavailable", true)
-	}
-	if !base.Config.Yolo {
-		selected, _, err := config.LoadWorkspace(canonical)
-		if err != nil {
-			return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace configuration is unavailable", true)
-		}
-		selected.Server = base.Config.Server
-		selected.Yolo = false
-		selected.Workspace.Root = canonical
-		if err := config.Validate(selected); err != nil {
-			return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace configuration is invalid", false)
-		}
-		base.Config = selected
-	}
-	base.Config.Workspace.Root = canonical
-	return canonical, inner, base, nil
-}
-
-func hasCodexThread(matches []codex.Session, threadID string) bool {
-	for _, match := range matches {
-		if strings.EqualFold(match.ThreadID, threadID) {
-			return true
-		}
-	}
-	return false
-}
-
-func normalizeYOLOWorkspace(raw json.RawMessage, root string) (json.RawMessage, error) {
-	var fields map[string]json.RawMessage
-	if err := decode(raw, &fields); err != nil {
-		return nil, errs.New(errs.ErrInvalidInput, "invalid tool arguments", false)
-	}
-
-	value, ok := fields["workspace"]
-	if !ok {
-		return raw, nil
-	}
-
-	var workspace string
-	if err := json.Unmarshal(value, &workspace); err != nil || strings.TrimSpace(workspace) == "" {
-		return nil, errs.New(errs.ErrInvalidInput, "workspace must be a non-empty string", false)
-	}
-	if !filepath.IsAbs(workspace) || filepath.Clean(workspace) != filepath.Clean(root) {
-		return nil, errs.New(errs.ErrInvalidInput, "workspace does not match the YOLO startup workspace", false)
-	}
-
-	copied := make(map[string]json.RawMessage, len(fields)-1)
-	for key, field := range fields {
-		if key != "workspace" {
-			copied[key] = field
-		}
-	}
-	normalized, err := json.Marshal(copied)
-	if err != nil {
-		return nil, errs.New(errs.ErrInvalidInput, "invalid tool arguments", false)
-	}
-	return normalized, nil
-}
-
-func workspaceSchema(schema any) map[string]any {
-	result, ok := schema.(map[string]any)
-	if !ok {
-		return map[string]any{"type": "object", "properties": map[string]any{"workspace": map[string]any{"type": "string"}}, "required": []string{"workspace"}, "additionalProperties": false}
-	}
-	copy := make(map[string]any, len(result)+1)
-	for key, value := range result {
-		copy[key] = value
-	}
-	properties := map[string]any{"workspace": map[string]any{"type": "string", "minLength": 1}}
-	if existing, ok := copy["properties"].(map[string]any); ok {
-		for key, value := range existing {
-			properties[key] = value
-		}
-	}
-	copy["properties"] = properties
-	copy["required"] = append([]string{"workspace"}, stringSlice(copy["required"])...)
-	copy["additionalProperties"] = false
-	return copy
-}
-
-func stringSlice(value any) []string {
-	values, _ := value.([]string)
-	return values
-}
-
-func selectWorkspace(base Dependencies, raw json.RawMessage) (string, json.RawMessage, Dependencies, error) {
-	workspace, inner, err := splitWorkspace(raw)
-	if err != nil {
-		return "", nil, base, err
-	}
-	if !filepath.IsAbs(workspace) {
-		return "", nil, base, errs.New(errs.ErrInvalidInput, "workspace must be an absolute path", false)
-	}
-	requested := filepath.Clean(workspace)
-	registered, err := config.LoadRegistry()
-	if err != nil {
-		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace registry is unavailable", true)
-	}
-	matched := false
-	for _, root := range registered {
-		if root == requested {
-			matched = true
-			break
-		}
-	}
-	if !matched {
-		return "", nil, base, errs.New(errs.ErrWorkspaceNotFound, "workspace is not registered", false)
-	}
-	canonical, err := filepath.EvalSymlinks(requested)
-	if err != nil || filepath.Clean(canonical) != requested {
-		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace is unavailable", true)
-	}
-	info, err := os.Stat(canonical)
-	if err != nil || !info.IsDir() {
-		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace is unavailable", true)
-	}
-	selected, _, err := config.LoadWorkspace(requested)
-	if err != nil {
-		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace configuration is unavailable", true)
-	}
-	selected.Server = base.Config.Server
-	selected.Yolo = false
-	if err := config.Validate(selected); err != nil {
-		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace configuration is invalid", false)
-	}
-	files, err := filesystem.New(requested, selected.Limits)
-	if err != nil {
-		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace filesystem is unavailable", true)
-	}
-	runtimeService, err := grinruntime.New(selected, files.Root())
-	if err != nil {
-		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace runtime is unavailable", true)
-	}
-	selected.Workspace.Root = files.Root()
-	base.Config = selected
-	base.Filesystem = files
-	base.Runtime = runtimeService
-	base.Git = gringit.New(runtimeService, files.Root())
-	base.Policy = policy.New(false)
-	return files.Root(), inner, base, nil
-}
-
-func splitWorkspace(raw json.RawMessage) (string, json.RawMessage, error) {
-	var fields map[string]json.RawMessage
-	if err := decode(raw, &fields); err != nil {
-		return "", nil, errs.New(errs.ErrInvalidInput, "invalid tool arguments", false)
-	}
-	value, ok := fields["workspace"]
-	if !ok {
-		return "", nil, errs.New(errs.ErrWorkspaceRequired, "workspace is required", false)
-	}
-	var workspace string
-	if err := json.Unmarshal(value, &workspace); err != nil || strings.TrimSpace(workspace) == "" {
-		return "", nil, errs.New(errs.ErrInvalidInput, "workspace must be a non-empty string", false)
-	}
-	delete(fields, "workspace")
-	inner, err := json.Marshal(fields)
-	if err != nil {
-		return "", nil, errs.New(errs.ErrInvalidInput, "invalid tool arguments", false)
-	}
-	return workspace, inner, nil
 }
 
 func completionSummary(output any) string {

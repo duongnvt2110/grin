@@ -12,10 +12,6 @@ import (
 	"grin/internal/tui"
 )
 
-func ContextWithShutdown(parent context.Context) (context.Context, context.CancelFunc) {
-	return context.WithCancel(parent)
-}
-
 func (a *Application) Run(ctx context.Context) error {
 	subscription := a.bus.Subscribe()
 	reliableSubscription := a.bus.SubscribeReliable()

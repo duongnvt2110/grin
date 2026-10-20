@@ -461,6 +461,12 @@ test -f /tmp/grin-demo/approved.txt && echo approved_write_passed
 Record only redacted output. Never record API keys, tunnel IDs, cookies,
 authorization headers, or raw environment values.
 
+For **Codex terminal discovery on macOS**, the first attempt may also request
+Automation permission to read terminal titles in Ghostty, Terminal.app, or
+iTerm2. Follow the separate [macOS Automation permission guide](macos-automation.md)
+if macOS shows a control-app prompt. Normal Grin MCP connectivity does not
+require this permission.
+
 ## 10. Troubleshooting
 
 ### `tunnel-client` says the tunnel ID is missing

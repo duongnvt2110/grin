@@ -88,6 +88,53 @@ func TestInitializeWorkspaceWritesDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestInitializeWorkspaceRejectsConfigSymlinks(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		symlinkDir bool
+	}{
+		{name: "workspace config directory", symlinkDir: true},
+		{name: "legacy config file", symlinkDir: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			root := t.TempDir()
+			outside := t.TempDir()
+			outsideFile := filepath.Join(outside, "config.yaml")
+			const external = "version: 1\n"
+			if err := os.WriteFile(outsideFile, []byte(external), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.symlinkDir {
+				if err := os.Symlink(outside, filepath.Join(root, ".grin")); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+			} else {
+				if err := os.Mkdir(filepath.Join(root, ".grin"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outsideFile, filepath.Join(root, WorkspaceConfigPath)); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+			}
+			if _, err := InitializeWorkspace(root); err == nil {
+				t.Fatal("init accepted a symlinked workspace config destination")
+			}
+			got, err := os.ReadFile(outsideFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != external {
+				t.Fatalf("external target was modified: %q", got)
+			}
+			registered, err := LoadRegistry()
+			if err != nil || len(registered) != 0 {
+				t.Fatalf("failed initialization registered workspace: %v, %v", registered, err)
+			}
+		})
+	}
+}
+
 func TestInitializeWorkspaceMigratesLegacyConfig(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
@@ -289,6 +336,49 @@ func TestValidateRejectsNonLoopback(t *testing.T) {
 	cfg.Server.Bind = "0.0.0.0"
 	if err := Validate(cfg); err == nil {
 		t.Fatal("non-loopback bind was accepted")
+	}
+}
+
+func TestDecodeConfigRejectsRemovedMaxConcurrent(t *testing.T) {
+	for _, value := range []string{"8", "0", "null", "\"\""} {
+		t.Run(value, func(t *testing.T) {
+			data := []byte("version: 1\nlimits:\n  max_concurrent_requests: " + value + "\n")
+			_, err := decodeConfig(data)
+			if err == nil || !strings.Contains(err.Error(), "limits.max_concurrent_requests is no longer supported") {
+				t.Fatalf("removed concurrency limit accepted: err=%v", err)
+			}
+		})
+	}
+}
+
+func TestLoadWorkspaceRejectsRemovedMaxConcurrent(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".grin")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("version: 1\nlimits:\n  max_concurrent_requests: 8\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := LoadWorkspace(root); err == nil || !strings.Contains(err.Error(), "max_concurrent_requests is no longer supported") {
+		t.Fatalf("old workspace concurrency limit silently accepted: err=%v", err)
+	}
+}
+
+func TestRemovedMaxConcurrentDoesNotAffectOtherLimits(t *testing.T) {
+	cfg, err := decodeConfig([]byte("version: 1\nlimits:\n  max_processes: 42\n  max_search_results: 9\n  future_setting: ignored\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.MaxProcesses != 42 || cfg.Limits.MaxSearchResults != 9 {
+		t.Fatalf("existing resource limits were changed: %+v", cfg.Limits)
+	}
+	data, err := yaml.Marshal(Defaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "max_concurrent_requests") {
+		t.Fatal("removed concurrency limit remains in the default YAML")
 	}
 }
 

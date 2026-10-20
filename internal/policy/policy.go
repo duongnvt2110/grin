@@ -72,7 +72,7 @@ func (e PolicyEvaluator) Evaluate(_ context.Context, operation Operation) Result
 
 func isReadOnly(tool string) bool {
 	switch tool {
-	case "fs.list", "fs.stat", "fs.read_text", "fs.search", "workspace.info", "workspace.list", "process.list", "process.info", "system.info", "git.status", "git.diff", "git.log", "git.show", "codex.list", "codex.turn_result":
+	case "fs.list", "fs.stat", "fs.read_text", "fs.search", "workspace.info", "workspace.list", "process.list", "process.info", "system.info", "git.status", "git.diff", "git.log", "git.show", "codex.turn_result":
 		return true
 	default:
 		return false

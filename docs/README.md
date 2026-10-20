@@ -9,6 +9,8 @@ Use this page to choose the shortest guide for what you are trying to do.
 | See every CLI command and option | [README CLI reference](../README.md#cli) |
 | Connect Grin to ChatGPT with Secure MCP Tunnel | [ChatGPT + tunnel onboarding](onboarding.md) |
 | Queue, review once, loop, or manually resume ChatGPT ↔ Codex work | [Codex review](codex-review.md) |
+| Inspect terminal-title Codex thread candidates | [Codex terminal discovery](codex-discovery.md) |
+| Approve macOS Automation access for Ghostty, Terminal, or iTerm | [macOS Automation permission](macos-automation.md) |
 | Understand the runtime architecture and request flow | [System and components](components.md) |
 | Review tools, modes, and current safety boundaries | [Features and boundaries](features.md) |
 | Publish Grin binaries | [Release guide](releasing.md) |
@@ -26,6 +28,12 @@ onboarding.md
 
 codex-review.md
   queue Codex work, run a single review or review loop, and manually resume results
+
+codex-discovery.md
+  inspect read-only terminal title candidates and their verification limits
+
+macos-automation.md
+  approve or troubleshoot macOS Automation requests used by Codex discovery
 
 components.md
   system architecture, state/config ownership, request flows
