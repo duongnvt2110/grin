@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"grin/internal/config"
 	"grin/internal/errs"
@@ -446,5 +449,93 @@ func TestSearchFindsTextAndFileNames(t *testing.T) {
 	}
 	if len(result.Matches) != 2 || result.Matches[0].Path != "FIXME.txt" {
 		t.Fatalf("unexpected matches: %+v", result.Matches)
+	}
+}
+
+func TestSearchRedactsAndSkipsSensitiveContent(t *testing.T) {
+	service, root := testService(t)
+	const secret = "GRIN_SEARCH_SECRET_7F91C"
+	for path, content := range map[string]string{
+		".env":        "API_KEY=" + secret + "\n",
+		"safe.txt":    "API_KEY=" + secret + "\nPORT=3306\n",
+		"private.txt": "-----BEGIN PRIVATE KEY-----\n" + secret + "\n-----END PRIVATE KEY-----\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := service.Search(context.Background(), SearchInput{Query: "GRIN_SEARCH_SECRET", MaxResults: 10}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Matches) != 1 || result.Matches[0].Path != "safe.txt" {
+		t.Fatalf("sensitive search matches = %+v, want only safe.txt", result.Matches)
+	}
+	if strings.Contains(result.Matches[0].Text, secret) || result.Matches[0].Text != "API_KEY=<redacted>" {
+		t.Fatalf("search returned unsafe or unexpected text: %q", result.Matches[0].Text)
+	}
+
+	for _, path := range []string{".env", "private.txt"} {
+		result, err := service.Search(context.Background(), SearchInput{Path: path, Query: "GRIN_SEARCH_SECRET"}, false)
+		if err != nil {
+			t.Fatalf("Search(%q): %v", path, err)
+		}
+		if len(result.Matches) != 0 {
+			t.Fatalf("Search(%q) returned sensitive matches: %+v", path, result.Matches)
+		}
+	}
+
+	alias := filepath.Join(root, "env-alias")
+	if err := os.Symlink(filepath.Join(root, ".env"), alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	result, err = service.Search(context.Background(), SearchInput{Path: alias, Query: "GRIN_SEARCH_SECRET"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Matches) != 0 {
+		t.Fatalf("canonical sensitive symlink search returned matches: %+v", result.Matches)
+	}
+}
+
+func TestSearchSkipsFIFOWithoutBlocking(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named pipes use a different API on Windows")
+	}
+	if _, err := exec.LookPath("mkfifo"); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+	root := t.TempDir()
+	fifo := filepath.Join(root, "waiting.fifo")
+	if output, err := exec.Command("mkfifo", fifo).CombinedOutput(); err != nil {
+		t.Fatalf("create FIFO: %v: %s", err, output)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSearchFIFOHelper$")
+	for _, value := range os.Environ() {
+		if !strings.HasPrefix(value, "GRIN_SEARCH_FIFO_ROOT=") {
+			command.Env = append(command.Env, value)
+		}
+	}
+	command.Env = append(command.Env, "GRIN_SEARCH_FIFO_ROOT="+root)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("bounded FIFO search helper failed: %v: %s", err, output)
+	}
+}
+
+func TestSearchFIFOHelper(t *testing.T) {
+	root := os.Getenv("GRIN_SEARCH_FIFO_ROOT")
+	if root == "" {
+		return
+	}
+	service, err := New(root, config.Defaults().Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Search(context.Background(), SearchInput{Query: "missing"}, false); err != nil {
+		t.Fatal(err)
 	}
 }

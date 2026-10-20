@@ -82,6 +82,13 @@ type Subscription struct {
 
 func (s Subscription) Close() { s.close() }
 
+type reliableReceiver struct {
+	channel chan Event
+	closed  chan struct{}
+	pending int
+	closing bool
+}
+
 type Bus struct {
 	mu        sync.Mutex
 	capacity  int
@@ -89,7 +96,7 @@ type Bus struct {
 	nextID    uint64
 	dropped   uint64
 	telemetry map[uint64]chan Event
-	reliable  map[uint64]chan Event
+	reliable  map[uint64]*reliableReceiver
 	nextSubID uint64
 }
 
@@ -97,7 +104,7 @@ func New(capacity int) *Bus {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &Bus{capacity: capacity, telemetry: map[uint64]chan Event{}, reliable: map[uint64]chan Event{}}
+	return &Bus{capacity: capacity, telemetry: map[uint64]chan Event{}, reliable: map[uint64]*reliableReceiver{}}
 }
 
 func (b *Bus) Publish(event Event) {
@@ -117,17 +124,45 @@ func (b *Bus) PublishReliable(ctx context.Context, event Event) error {
 	// cannot drop the approval.
 	event = b.prepareLocked(event)
 	b.publishLocked(event)
-	subscribers := make([]chan Event, 0, len(b.reliable))
+	subscribers := make([]*reliableReceiver, 0, len(b.reliable))
 	for _, subscriber := range b.reliable {
+		subscriber.pending++
 		subscribers = append(subscribers, subscriber)
 	}
 	b.mu.Unlock()
 	if len(subscribers) == 0 {
 		return errors.New("reliable approval delivery is unavailable")
 	}
+	// An in-flight send keeps the event channel open until the publisher exits.
+	// Closing a subscription wakes blocked publishers through subscriber.closed.
+	defer func() {
+		b.mu.Lock()
+		for _, subscriber := range subscribers {
+			subscriber.pending--
+			if subscriber.closing && subscriber.pending == 0 {
+				close(subscriber.channel)
+			}
+		}
+		b.mu.Unlock()
+	}()
 	for _, subscriber := range subscribers {
 		select {
-		case subscriber <- event:
+		case <-subscriber.closed:
+			return errors.New("reliable approval subscriber closed")
+		default:
+		}
+		select {
+		case subscriber.channel <- event:
+			// A closed subscriber and a writable buffered channel can both win
+			// select. Acknowledge delivery only while the subscriber is active.
+			b.mu.Lock()
+			closing := subscriber.closing
+			b.mu.Unlock()
+			if closing {
+				return errors.New("reliable approval subscriber closed")
+			}
+		case <-subscriber.closed:
+			return errors.New("reliable approval subscriber closed")
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -166,26 +201,39 @@ func (b *Bus) publishLocked(event Event) {
 	}
 }
 
-func (b *Bus) Subscribe() Subscription { return b.subscribe(b.telemetry, false) }
-
-func (b *Bus) SubscribeReliable() Subscription { return b.subscribe(b.reliable, true) }
-
-func (b *Bus) subscribe(registry map[uint64]chan Event, reliable bool) Subscription {
+func (b *Bus) Subscribe() Subscription {
 	b.mu.Lock()
 	b.nextSubID++
 	id := b.nextSubID
-	buffer := b.capacity
-	if reliable {
-		buffer = 1
-	}
-	channel := make(chan Event, buffer)
-	registry[id] = channel
+	channel := make(chan Event, b.capacity)
+	b.telemetry[id] = channel
 	b.mu.Unlock()
 	return Subscription{Events: channel, close: func() {
 		b.mu.Lock()
-		if existing, ok := registry[id]; ok {
-			delete(registry, id)
+		if existing, ok := b.telemetry[id]; ok {
+			delete(b.telemetry, id)
 			close(existing)
+		}
+		b.mu.Unlock()
+	}}
+}
+
+func (b *Bus) SubscribeReliable() Subscription {
+	b.mu.Lock()
+	b.nextSubID++
+	id := b.nextSubID
+	subscriber := &reliableReceiver{channel: make(chan Event, 1), closed: make(chan struct{})}
+	b.reliable[id] = subscriber
+	b.mu.Unlock()
+	return Subscription{Events: subscriber.channel, close: func() {
+		b.mu.Lock()
+		if existing, ok := b.reliable[id]; ok {
+			delete(b.reliable, id)
+			close(existing.closed)
+			existing.closing = true
+			if existing.pending == 0 {
+				close(existing.channel)
+			}
 		}
 		b.mu.Unlock()
 	}}

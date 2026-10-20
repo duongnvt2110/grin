@@ -43,15 +43,55 @@ func TestServerInstructionsAreExposedDuringInitialization(t *testing.T) {
 	if result == nil {
 		t.Fatal("initialize result is nil")
 	}
-	for _, want := range []string{"AGENTS.md", "fs.read_text", "fs.search", "codex.list", "codex.queue", "codex.turn_result", "QUEUE ONLY", "SINGLE REVIEW", "REVIEW LOOP", "continue checking the same request", "If the result is interrupted", "do not automatically\nqueue a replacement", "If the result is failed, stop, report the failure", "preserve\nworkspace/thread_id/request_id", "do not automatically queue another request", "If any result is interrupted", "break the automatic\nloop", "If any result is failed, break the automatic\nloop, report the failure, preserve workspace/thread_id/request_id", "and do not\nqueue the next review request", "Retry only after the user explicitly asks", "Resume only after the user explicitly asks to\ncontinue", "re-run\ncodex.list before queueing a fresh request", "back to Codex.", "First determine the target project\nfrom the task and conversation.", "workspace.list discovers\nregistered workspaces; it does not select the target for a task.", "Never choose a workspace just because it is the only or first result.", "determine the task's exact target workspace before\nsession discovery.", "Keep the exact\nworkspace and thread_id pair", "A successful codex.queue call alone", "manually resume", "READY_FOR_IMPLEMENT", "Do not generate, infer, or queue IMPLEMENT", "NO_MATERIAL_FINDINGS", "before acting on the"} {
-		if !strings.Contains(result.Instructions, want) {
+	normalizedInstructions := strings.Join(strings.Fields(result.Instructions), " ")
+	for _, want := range []string{
+		"AGENTS.md",
+		"codex.queue",
+		"exact thread_id",
+		"previous standalone task",
+		"grin codex discover",
+		"terminal candidates",
+		"even when there is only one eligible candidate",
+		"ask the user which one to select",
+		"thread title",
+		"no message queued",
+		"Never select by result order, recency",
+		"Eligible candidates that pass ambiguity checks",
+		"If none is eligible",
+		"fresh, read-only discovery",
+		"selection_required",
+		"For every new standalone send or review",
+		"omit thread_id",
+		"must still match a fresh eligible discovery result",
+		"same uninterrupted review",
+		"Selection alone does not authorize sending a message or implementing code",
+		"the earlier send authorization remains applicable",
+		"server enforces technical eligibility",
+		"UNRESOLVED",
+		"Codex app-server",
+		"READY_FOR_IMPLEMENT",
+		"NO_MATERIAL_FINDINGS",
+	} {
+		if !strings.Contains(normalizedInstructions, strings.Join(strings.Fields(want), " ")) {
 			t.Fatalf("server instructions missing %q: %s", want, result.Instructions)
 		}
 	}
+	start := strings.Index(result.Instructions, "For Codex requests, codex.queue performs fresh")
+	if start < 0 {
+		t.Fatal("current-TUI discovery section is missing")
+	}
+	end := strings.Index(result.Instructions[start:], "Codex review supports three behaviors:")
+	if end < 0 {
+		t.Fatal("current-TUI discovery section boundaries are missing")
+	}
+	workflow := result.Instructions[start : start+end]
+	if strings.Contains(result.Instructions, "codex.list") || strings.Contains(result.Instructions, "codex-thread-discovery") || !strings.Contains(workflow, "grin codex discover") {
+		t.Fatalf("Codex instructions advertise an external discovery path or omit Grin discovery: %s", result.Instructions)
+	}
 }
 
-func TestCodexToolsUseExplicitWorkspaceAndNormalRegistry(t *testing.T) {
-	session, server, fake, _, startup, target := newCodexMCPTest(t, false, nil)
+func TestCodexQueueDescriptionRequiresTaskRecipientSelection(t *testing.T) {
+	session, server, _, _, _, _ := newCodexMCPTest(t, false, nil)
 	defer session.Close()
 	defer server.Close()
 
@@ -59,7 +99,171 @@ func TestCodexToolsUseExplicitWorkspaceAndNormalRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wanted := map[string]bool{"codex.list": false, "codex.queue": false, "codex.turn_result": false}
+	for _, tool := range tools.Tools {
+		if tool.Name != "codex.queue" {
+			continue
+		}
+		for _, want := range []string{
+			"Freshly discover Codex threads",
+			"Omit thread_id to request fresh candidates",
+			"UNRESOLVED candidates are never selected automatically",
+			"Eligible candidates that pass ambiguity checks",
+			"selection_required",
+			"supplied IDs must still match fresh discovery",
+			"same uninterrupted review loop",
+		} {
+			if !strings.Contains(tool.Description, want) {
+				t.Errorf("codex.queue description missing %q: %s", want, tool.Description)
+			}
+		}
+		return
+	}
+	t.Fatal("codex.queue is not registered")
+}
+
+func TestCodexQueueDelegatesValidationToService(t *testing.T) {
+	session, server, fake, _, _, target := newCodexMCPTest(t, false, nil)
+	defer session.Close()
+	defer server.Close()
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name:      "codex.queue",
+		Arguments: workspaceArgs(target, map[string]any{"thread_id": testThreadID, "message": "review"}),
+	})
+	if err != nil || result.IsError || !fake.queued || fake.queuedThread != testThreadID {
+		t.Fatalf("queue delegation = %+v, err=%v", result, err)
+	}
+}
+
+func TestCodexQueueFreshRecipientRouting(t *testing.T) {
+	const otherID = "01a0717c-c5db-7fb2-92df-0ce116432123"
+	eligible := func(id, terminal string) codex.ThreadCandidate {
+		return codex.ThreadCandidate{
+			TerminalObservation: codex.TerminalObservation{ID: terminal},
+			ThreadID:            id, ThreadTitle: "candidate " + terminal,
+			WorkspaceMatch: "yes", TopLevel: "yes", Resolution: "title_uuid_correlated",
+		}
+	}
+	for _, tc := range []struct {
+		name        string
+		candidates  []codex.ThreadCandidate
+		requestedID string
+		wantID      string
+		wantChoice  bool
+		choiceID    string
+		wantError   bool
+	}{
+		{name: "unresolved singleton requires explicit selection", candidates: []codex.ThreadCandidate{eligible(testThreadID, "term-a")}, wantChoice: true, choiceID: testThreadID},
+		{name: "two threads require selection", candidates: []codex.ThreadCandidate{eligible(testThreadID, "term-a"), eligible(otherID, "term-b")}, wantChoice: true, choiceID: otherID},
+		{name: "duplicate unresolved thread requires explicit selection", candidates: []codex.ThreadCandidate{eligible(testThreadID, "term-a"), eligible(testThreadID, "term-b")}, wantChoice: true, choiceID: testThreadID},
+		{name: "explicit singleton accepted despite unresolved status", candidates: []codex.ThreadCandidate{eligible(testThreadID, "term-a")}, requestedID: testThreadID, wantID: testThreadID},
+		{name: "explicit selected thread verified afresh despite unresolved status", candidates: []codex.ThreadCandidate{eligible(testThreadID, "term-a"), eligible(otherID, "term-b")}, requestedID: otherID, wantID: otherID},
+		{name: "stale explicit ID rejected", candidates: []codex.ThreadCandidate{eligible(otherID, "term-b")}, requestedID: testThreadID, wantError: true},
+		{name: "no candidate rejects send", wantError: true},
+		{name: "unverified title rejects send", candidates: []codex.ThreadCandidate{{ThreadID: testThreadID, WorkspaceMatch: "yes", TopLevel: "unknown", Resolution: "unverified_title_uuid"}}, wantError: true},
+		{name: "one eligible plus unknown thread rejects automatic send", candidates: []codex.ThreadCandidate{
+			eligible(testThreadID, "term-a"),
+			{ThreadID: otherID, WorkspaceMatch: "unknown", TopLevel: "unknown", Resolution: "unverified_title_uuid"},
+		}, wantError: true},
+		{name: "one eligible plus another partial title rejects automatic send", candidates: []codex.ThreadCandidate{
+			eligible(testThreadID, "term-a"),
+			{UUIDPrefix: "01a0717c-c5db", WorkspaceMatch: "unknown", TopLevel: "unknown", Resolution: "no_match"},
+		}, wantError: true},
+		{name: "archived title rejects send", candidates: []codex.ThreadCandidate{{ThreadID: testThreadID, WorkspaceMatch: "yes", TopLevel: "unknown", Resolution: "archived_title"}}, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session, server, fake, bus, _, workspace := newCodexMCPTest(t, false, nil)
+			defer session.Close()
+			defer server.Close()
+			fake.discovery = &codex.DiscoveryResult{Status: "UNRESOLVED", Candidates: tc.candidates}
+			arguments := map[string]any{"message": "review"}
+			if tc.requestedID != "" {
+				arguments["thread_id"] = tc.requestedID
+			}
+			result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+				Name: "codex.queue", Arguments: workspaceArgs(workspace, arguments),
+			})
+			if err != nil || result == nil || fake.discoveryCalls != 1 {
+				t.Fatalf("queue/discovery call = %+v, err %v, count %d", result, err, fake.discoveryCalls)
+			}
+			if tc.wantError {
+				if !result.IsError || fake.queued {
+					t.Fatalf("unsafe recipient was queued: %+v, queued %v", result, fake.queued)
+				}
+				return
+			}
+			if result.IsError {
+				t.Fatalf("queue failed: %+v", result)
+			}
+			if tc.wantChoice {
+				if fake.queued || fake.queueCalls != 0 || len(result.Content) == 0 ||
+					!strings.Contains(result.Content[0].(*sdk.TextContent).Text, "selection_required") ||
+					!strings.Contains(result.Content[0].(*sdk.TextContent).Text, tc.choiceID) {
+					t.Fatalf("eligible candidates did not require explicit choice: %+v", result)
+				}
+				foundSelectionSummary := false
+				for _, event := range bus.Snapshot() {
+					if event.Tool == "codex.queue" && event.Type == events.EventToolCompleted &&
+						event.Summary != "Codex recipient selection required; no message queued" {
+						t.Fatalf("selection event summary = %q", event.Summary)
+					}
+					if event.Tool == "codex.queue" && event.Type == events.EventToolCompleted {
+						foundSelectionSummary = true
+					}
+				}
+				if !foundSelectionSummary {
+					t.Fatal("selection completion event was not published")
+				}
+				return
+			}
+			if !fake.queued || fake.queuedThread != tc.wantID {
+				t.Fatalf("wrong target: queued %v, target %q, want %q", fake.queued, fake.queuedThread, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestCodexQueueDoesNotCachePreviousTaskRecipient(t *testing.T) {
+	const newID = "01a0717c-c5db-7fb2-92df-0ce116432123"
+	session, server, fake, _, _, workspace := newCodexMCPTest(t, false, nil)
+	defer session.Close()
+	defer server.Close()
+	for index, id := range []string{testThreadID, newID} {
+		fake.discovery = &codex.DiscoveryResult{Status: "UNRESOLVED", Candidates: []codex.ThreadCandidate{{
+			ThreadID: id, WorkspaceMatch: "yes", TopLevel: "yes", Resolution: "title_uuid_correlated",
+		}}}
+		fake.queued = false
+		result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+			Name: "codex.queue", Arguments: workspaceArgs(workspace, map[string]any{"thread_id": id, "message": "review"}),
+		})
+		if err != nil || result.IsError || !fake.queued || fake.queuedThread != id || fake.discoveryCalls != index+1 {
+			t.Fatalf("send %d reused a prior ID: result %+v, err %v, routed %q, discoveries %d", index, result, err, fake.queuedThread, fake.discoveryCalls)
+		}
+	}
+}
+
+func TestCodexQueueDiscoveryFailureDoesNotSend(t *testing.T) {
+	session, server, fake, _, _, workspace := newCodexMCPTest(t, false, nil)
+	defer session.Close()
+	defer server.Close()
+	fake.discoveryErr = fmt.Errorf("native title API timeout")
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name: "codex.queue", Arguments: workspaceArgs(workspace, map[string]any{"message": "review"}),
+	})
+	if err != nil || result == nil || !result.IsError || fake.queued || fake.discoveryCalls != 1 {
+		t.Fatalf("discovery failure should prevent send: %+v, err %v", result, err)
+	}
+}
+
+func TestCodexToolsUseExplicitWorkspaceAndNormalRegistry(t *testing.T) {
+	session, server, _, _, _, _ := newCodexMCPTest(t, false, nil)
+	defer session.Close()
+	defer server.Close()
+
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wanted := map[string]bool{"codex.queue": false, "codex.turn_result": false}
 	var workspaceListDescription string
 	for _, tool := range tools.Tools {
 		if tool.Name == "workspace.list" {
@@ -81,51 +285,26 @@ func TestCodexToolsUseExplicitWorkspaceAndNormalRegistry(t *testing.T) {
 		}
 	}
 
-	missing, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "codex.list", Arguments: map[string]any{}})
-	if err != nil || !missing.IsError || !strings.Contains(missing.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceRequired)) {
-		t.Fatalf("codex.list without workspace = %+v, err=%v", missing, err)
-	}
-	if len(fake.listCalls) != 0 {
-		t.Fatal("codex.list reached the service without a selected workspace")
-	}
-
-	unregistered, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "codex.list", Arguments: workspaceArgs(startup, map[string]any{})})
-	if err != nil || !unregistered.IsError || !strings.Contains(unregistered.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceNotFound)) {
-		t.Fatalf("codex.list for an unregistered workspace = %+v, err=%v", unregistered, err)
-	}
-	if len(fake.listCalls) != 0 {
-		t.Fatal("unregistered workspace reached the Codex service")
-	}
-
-	listed, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "codex.list", Arguments: workspaceArgs(target, map[string]any{})})
-	if err != nil || listed.IsError || !strings.Contains(listed.Content[0].(*sdk.TextContent).Text, testThreadID) {
-		t.Fatalf("codex.list for registered workspace = %+v, err=%v", listed, err)
-	}
-	if len(fake.listCalls) != 1 || fake.listCalls[0] != target {
-		t.Fatalf("Codex list workspace calls = %v, want %q", fake.listCalls, target)
+	for _, tool := range tools.Tools {
+		if tool.Name == "codex.list" {
+			t.Fatal("removed codex.list is still registered")
+		}
 	}
 }
 
-func TestCodexToolsInYoloCanTargetOutsideStartupRoot(t *testing.T) {
-	session, server, fake, bus, startup, target := newCodexMCPTest(t, true, nil)
+func TestCodexToolCatalogOmitsRemovedListInYoloMode(t *testing.T) {
+	session, server, _, _, _, _ := newCodexMCPTest(t, true, nil)
 	defer session.Close()
 	defer server.Close()
 
-	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "codex.list", Arguments: workspaceArgs(target, map[string]any{})})
-	if err != nil || result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, target) {
-		t.Fatalf("YOLO codex.list target = %+v, err=%v", result, err)
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(fake.listCalls) != 1 || fake.listCalls[0] != target || fake.listCalls[0] == startup {
-		t.Fatalf("YOLO target workspace calls = %v", fake.listCalls)
-	}
-	foundTargetEvent := false
-	for _, event := range bus.Snapshot() {
-		if event.Tool == "codex.list" && event.Workspace == target {
-			foundTargetEvent = true
+	for _, tool := range tools.Tools {
+		if tool.Name == "codex.list" {
+			t.Fatal("removed codex.list is still registered in YOLO mode")
 		}
-	}
-	if !foundTargetEvent {
-		t.Fatal("Codex lifecycle events omitted the explicitly selected YOLO workspace")
 	}
 }
 
@@ -206,8 +385,8 @@ func TestCodexQueuePolicyDenialDoesNotQueue(t *testing.T) {
 		Name:      "codex.queue",
 		Arguments: workspaceArgs(target, map[string]any{"thread_id": testThreadID, "message": "review"}),
 	})
-	if err != nil || !result.IsError || fake.queued {
-		t.Fatal("denied Codex queue unexpectedly executed")
+	if err != nil || !result.IsError || fake.queued || fake.discoveryCalls != 0 {
+		t.Fatal("denied Codex queue performed discovery or execution")
 	}
 }
 
@@ -264,8 +443,8 @@ func TestCodexQueueApprovalRejectionAndCancellationDoNotQueue(t *testing.T) {
 				t.Fatal(err)
 			}
 			result := <-resultChannel
-			if callErr := <-errorChannel; callErr != nil || result == nil || !result.IsError || fake.queued {
-				t.Fatal("rejected or cancelled Codex queue executed")
+			if callErr := <-errorChannel; callErr != nil || result == nil || !result.IsError || fake.queued || fake.discoveryCalls != 0 {
+				t.Fatal("rejected or cancelled Codex queue performed discovery or execution")
 			}
 		})
 	}
@@ -304,21 +483,39 @@ func TestCodexTurnResultReturnsPendingForSameRequestCorrelation(t *testing.T) {
 }
 
 type fakeCodexTools struct {
-	listCalls     []string
-	queued        bool
-	queuedThread  string
-	queuedMessage string
-	turnResult    codex.TurnResult
-	resultCalls   []string
-	resultLimit   int64
+	queueErr       error
+	queued         bool
+	queueCalls     int
+	queuedThread   string
+	queuedMessage  string
+	discovery      *codex.DiscoveryResult
+	discoveryErr   error
+	discoveryCalls int
+	turnResult     codex.TurnResult
+	resultCalls    []string
+	resultLimit    int64
 }
 
-func (f *fakeCodexTools) List(_ context.Context, workspace string) (codex.ListResult, error) {
-	f.listCalls = append(f.listCalls, workspace)
-	return codex.ListResult{Workspace: workspace, Running: true, Matches: []codex.Session{{PID: 42, ThreadID: testThreadID}}}, nil
+func (f *fakeCodexTools) Discover(_ context.Context, workspace string) (codex.DiscoveryResult, error) {
+	f.discoveryCalls++
+	if f.discoveryErr != nil {
+		return codex.DiscoveryResult{}, f.discoveryErr
+	}
+	if f.discovery != nil {
+		return *f.discovery, nil
+	}
+	return codex.DiscoveryResult{Status: "UNRESOLVED", Candidates: []codex.ThreadCandidate{{
+		TerminalObservation: codex.TerminalObservation{ID: "term-a"},
+		ThreadID:            testThreadID, ThreadTitle: "default test recipient", WorkspaceMatch: "yes",
+		TopLevel: "yes", Resolution: "title_uuid_correlated",
+	}}}, nil
 }
 
 func (f *fakeCodexTools) Queue(_ context.Context, _, threadID, message string) (codex.QueueResult, error) {
+	f.queueCalls++
+	if f.queueErr != nil {
+		return codex.QueueResult{}, f.queueErr
+	}
 	f.queued = true
 	f.queuedThread = threadID
 	f.queuedMessage = message
@@ -564,6 +761,49 @@ func TestSelectedWorkspaceConfigIsValidated(t *testing.T) {
 	}
 }
 
+func TestCodexSelectorRejectsInvalidSelectedWorkspaceConfigBeforeDiscovery(t *testing.T) {
+	session, server, fake, _, _, target := newCodexMCPTest(t, false, nil)
+	defer session.Close()
+	defer server.Close()
+	if err := os.MkdirAll(filepath.Join(target, ".grin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, config.WorkspaceConfigPath), []byte("version: 1\nlimits:\n  max_processes: -1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name: "codex.queue", Arguments: workspaceArgs(target, map[string]any{"message": "review"}),
+	})
+	if err != nil || result == nil || !result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceUnavailable)) {
+		t.Fatalf("invalid Codex workspace config result = %+v, err=%v", result, err)
+	}
+	if fake.discoveryCalls != 0 || fake.queueCalls != 0 {
+		t.Fatalf("invalid workspace config called Codex: discover=%d queue=%d", fake.discoveryCalls, fake.queueCalls)
+	}
+}
+
+func TestCodexSelectorRejectsReplacedWorkspaceSymlinkBeforeDiscovery(t *testing.T) {
+	session, server, fake, _, _, target := newCodexMCPTest(t, false, nil)
+	defer session.Close()
+	defer server.Close()
+	moved := filepath.Join(t.TempDir(), "moved")
+	if err := os.Rename(target, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, target); err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name: "codex.queue", Arguments: map[string]any{"workspace": target, "message": "review"},
+	})
+	if err != nil || result == nil || !result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceUnavailable)) {
+		t.Fatalf("replaced Codex workspace result = %+v, err=%v", result, err)
+	}
+	if fake.discoveryCalls != 0 || fake.queueCalls != 0 {
+		t.Fatalf("replaced workspace called Codex: discover=%d queue=%d", fake.discoveryCalls, fake.queueCalls)
+	}
+}
+
 func TestWorkspaceInfoUsesSelectedWorkspace(t *testing.T) {
 	root := t.TempDir()
 	registerTestWorkspace(t, root)
@@ -700,6 +940,66 @@ func TestStreamableHTTPReadTextRedactsSensitiveContent(t *testing.T) {
 	for _, event := range bus.Snapshot() {
 		if strings.Contains(event.Summary, secret) || strings.Contains(event.Detail, secret) {
 			t.Fatalf("lifecycle event leaked the sensitive sentinel: %+v", event)
+		}
+	}
+}
+
+func TestStreamableHTTPSearchRedactsSensitiveMatches(t *testing.T) {
+	root := t.TempDir()
+	registerTestWorkspace(t, root)
+	const secret = "GRIN_SEARCH_SECRET_7F91C"
+	if err := os.WriteFile(filepath.Join(root, "config.txt"), []byte("API_KEY="+secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Defaults()
+	cfg.Workspace.Root = root
+	files, err := filesystem.New(root, cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{
+		Filesystem: files,
+		Config:     cfg,
+		Version:    "test",
+		Policy:     policy.New(false),
+	})))
+	defer httpServer.Close()
+
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(context.Background(), &sdk.StreamableClientTransport{
+		Endpoint:             httpServer.URL,
+		HTTPClient:           httpServer.Client(),
+		MaxRetries:           -1,
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+		Name:      "fs.search",
+		Arguments: workspaceArgs(root, map[string]any{"query": "GRIN_SEARCH_SECRET"}),
+	})
+	if err != nil || result.IsError || len(result.Content) == 0 {
+		t.Fatalf("unexpected fs.search result: %+v, err=%v", result, err)
+	}
+	serialized := result.Content[0].(*sdk.TextContent).Text
+	structured, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"serialized": serialized, "structured": string(structured)} {
+		if strings.Contains(value, secret) {
+			t.Errorf("%s search result leaked sensitive content", name)
+		}
+		var decoded filesystem.SearchOutput
+		if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+			t.Fatalf("%s result is not valid search JSON: %v", name, err)
+		}
+		if len(decoded.Matches) != 1 || decoded.Matches[0].Text != "API_KEY=<redacted>" {
+			t.Errorf("%s search result did not preserve the redacted match: %+v", name, decoded.Matches)
 		}
 	}
 }
@@ -888,8 +1188,8 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 19 {
-		t.Fatalf("expected nineteen normal-mode tools, got %d", len(tools.Tools))
+	if len(tools.Tools) != 18 {
+		t.Fatalf("expected eighteen normal-mode tools, got %d", len(tools.Tools))
 	}
 	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(root, map[string]any{"path": "note.txt"})})
 	if err != nil {

@@ -20,6 +20,8 @@ implementation. For installation and CLI usage, start with the
 
 Normal mode is the default and recommended mode.
 
+The former `limits.max_concurrent_requests` setting was unused and has been removed. If an existing `.grin/config.yaml` still contains it, Grin reports an unsupported-setting error; remove that entry. Existing shell, search, process, approval and event limits remain unchanged. No new concurrency limiter is enabled.
+
 ## MCP tools
 
 ### Global tools
@@ -39,29 +41,40 @@ the capability and boundary reference.
 
 | Tool | Purpose |
 | --- | --- |
-| `codex.list` | Find currently running top-level Codex threads for one explicit workspace. |
-| `codex.queue` | Send a message to one exact live thread and return a `request_id`. |
+| `codex.queue` | Discover eligible threads afresh, require an explicit recipient UUID for unresolved candidates, and return a `request_id` only when queued. |
 | `codex.turn_result` | Read the exact persisted turn correlated with that `request_id`. |
 
-All three tools require an explicit absolute workspace.
+Both tools require an explicit absolute workspace.
 
 - **Normal mode:** the lexically cleaned path must match a registered canonical
   workspace; symlink aliases are rejected.
 - **YOLO mode:** any existing absolute workspace may be used for Codex tools.
-- Live-session discovery currently supports macOS only.
-- Grin requires the Codex CLI and `sqlite3` locally.
+- `codex.queue` uses the local Codex app-server and does not identify a
+  separate TUI's displayed thread. `grin codex discover` returns read-only
+  title candidates, but keeps them `UNRESOLVED` because title freshness cannot
+  be proven across `/new`, `/clear`, and `/resume`.
+- Grin requires the Codex app-server and `sqlite3` locally.
 - Result lookup supports the default `~/.codex` data root only.
 
-Grin never guesses a Codex thread or falls back to the latest result. If
-multiple live threads match, the caller must choose one. If the workspace
-changes, call `codex.list` again.
+For new standalone sends, omit `thread_id` to request fresh candidates.
+Title-derived candidates are `UNRESOLVED`, so even a single eligible UUID
+requires explicit selection and is never queued automatically. When discovery
+passes ambiguity checks, candidates return as `selection_required` without
+queueing. Missing or competing unverified metadata fails closed. The user must
+select a candidate, then supply its UUID. Supplied UUIDs must match fresh
+eligible discovery, including during review loops, so a former thread removed
+by `/new` or `/clear` cannot be silently reused. The app-server queues an
+already-loaded, direct-input-capable thread without
+resuming it; otherwise it resumes the validated thread before queueing.
+Terminal title freshness and displayed TUI ownership still cannot be
+independently established from discovery alone.
 
 ChatGPT can use these tools in three ways: **Queue Only**, **Single Review**, or
 **Review Loop**. These are client-side behaviors; Grin stores no review-mode
 state. If a waited-for Codex turn returns `failed` or `interrupted`, Single
 Review and Review Loop stop instead of automatically queueing a replacement.
-Human retry or continue revalidates the live thread with `codex.list` and uses
-a fresh `codex.queue` request with a new `request_id`.
+Human retry or continue uses the same exact thread ID and a fresh `codex.queue`
+request with a new `request_id`.
 
 Review Loop has two authorization phases:
 
@@ -104,7 +117,7 @@ selected workspace.
 | Class | Tools | Effect |
 | --- | --- | --- |
 | Discovery/compatibility | `workspace.list` | Reads the normal-mode registry, or returns the YOLO startup workspace without routing. |
-| Codex session | `codex.list`, `codex.queue`, `codex.turn_result` | Targets an explicit workspace and exact Codex thread/request; does not store conversation state. |
+| Codex session | `codex.queue`, `codex.turn_result` | Validates and queues an exact app-server thread, resuming only when required. |
 | Workspace read | `workspace.info` | Reads selected-workspace metadata. |
 | Filesystem read | `fs.list`, `fs.stat`, `fs.read_text`, `fs.search` | Reads or searches filesystem content/metadata. |
 | Git read | `git.status`, `git.diff`, `git.log`, `git.show` | Reads repository state/history; never writes Git state. |
@@ -128,8 +141,8 @@ workspace and approval restrictions for supported tools.
 | Operation | Location | Normal mode |
 | --- | --- | --- |
 | `workspace.info` | selected workspace | ALLOW |
-| `codex.list`, `codex.turn_result` | validated explicit workspace | ALLOW |
-| `codex.queue` | validated registered workspace and live thread | ALLOW |
+| `codex.turn_result` | validated explicit workspace | ALLOW |
+| `codex.queue` | validated registered workspace and exact thread | ALLOW |
 | `git.*` | selected workspace | ALLOW |
 | `process.*`, `system.info` | host/global | ALLOW |
 | `fs.list/stat/read_text/search` | inside selected workspace | Execute after validation; no policy decision on this path |
@@ -245,8 +258,10 @@ validation, output/resource limits, cancellation, or process cleanup.
 - Ordinary text reads redact recognized sensitive assignments, simple JSON
   fields, and supported `user:password@host` URL credentials before returning
   content.
-- Matching is conservative and is not a complete secret scanner. `fs.search`,
-  Git output, and shell output are outside this feature.
+- Matching is conservative and is not a complete secret scanner. `fs.search`
+  skips common credential/private-key paths and private-key content, and
+  redacts recognized credential-shaped matching lines. Git output and shell
+  output are outside this feature.
 - Codex review results use the shared text redactor and output limit; private
   key material is blocked rather than returned.
 - `fs.edit_text` replaces one exact text occurrence.

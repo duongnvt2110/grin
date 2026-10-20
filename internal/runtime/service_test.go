@@ -35,6 +35,9 @@ func TestHelperProcess(t *testing.T) {
 		time.Sleep(time.Minute)
 	case "output":
 		_, _ = fmt.Print(strings.Repeat("x", 1024))
+	case "burst":
+		_, _ = fmt.Fprint(os.Stdout, strings.Repeat("O", 128*1024))
+		_, _ = fmt.Fprint(os.Stderr, strings.Repeat("E", 128*1024))
 	}
 	os.Exit(0)
 }
@@ -382,6 +385,26 @@ func TestRunCommandTimeoutCancellationAndOutputLimit(t *testing.T) {
 	}
 	if len(result.Stdout) != 10 {
 		t.Fatalf("captured output length = %d, want 10", len(result.Stdout))
+	}
+}
+
+func TestRunCommandDrainsBothPipesBeforeWait(t *testing.T) {
+	service := testService(t)
+	service.limits.MaxShellStdoutBytes = 256 * 1024
+	service.limits.MaxShellStderrBytes = 256 * 1024
+	t.Setenv("HELPER_MODE", "burst")
+	result, err := service.RunCommand(context.Background(), helperRequest("burst"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("exit code = %d, want 0", result.ExitCode)
+	}
+	if got, want := result.Stdout, strings.Repeat("O", 128*1024); got != want {
+		t.Fatalf("stdout length=%d, want exact %d bytes", len(got), len(want))
+	}
+	if got, want := result.Stderr, strings.Repeat("E", 128*1024); got != want {
+		t.Fatalf("stderr length=%d, want exact %d bytes", len(got), len(want))
 	}
 }
 

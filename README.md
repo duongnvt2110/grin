@@ -19,8 +19,8 @@ Grin keeps local execution on your machine. It adds workspace routing, policy,
 approvals, limits, redaction, and a visible terminal UI between ChatGPT and your
 local tools.
 
-For Codex review work, Grin also provides dedicated `codex.list`,
-`codex.queue`, and `codex.turn_result` MCP tools; see the
+For Codex review work, Grin also provides dedicated `codex.queue` and
+`codex.turn_result` MCP tools; see the
 [Codex review guide](docs/codex-review.md).
 
 > Grin is not an OS sandbox. Keep its MCP endpoint loopback-only and do not
@@ -100,17 +100,18 @@ then select that tunnel in ChatGPT.
 
 ## Codex review
 
-Grin can connect ChatGPT to a Codex session that is already running in your
-workspace. ChatGPT can queue a message only, perform one independent review, or
-run a repeated review loop using the same three MCP tools.
+Grin can start or resume Codex app-server sessions in your workspace. ChatGPT
+can queue a message only, perform one independent review, or run a repeated
+review loop through Grin's MCP tools.
 
 A typical review-loop workflow is:
 
 ```text
 ChatGPT
-  ↓ codex.list
-select the running Codex thread
-  ↓ codex.queue
+  ↓ codex.queue (fresh server-side discovery)
+one or more eligible threads → ask the user to select; no automatic send
+competing unverified identity → fail closed without sending
+  ↓ exact thread ID via app-server
 Codex reviews the plan
   ↓ codex.turn_result
 ChatGPT independently verifies the result
@@ -261,7 +262,7 @@ Use `--version` for a specific release or `--dir` for a custom install path.
 | Filesystem | `fs.list`, `fs.stat`, `fs.read_text`, `fs.search`, `fs.write_text`, `fs.edit_text` |
 | Git | `git.status`, `git.diff`, `git.log`, `git.show` |
 | Shell | `shell.run` |
-| Codex review | `codex.list`, `codex.queue`, `codex.turn_result` |
+| Codex review | `codex.queue`, `codex.turn_result` |
 | Host inspection | `process.list`, `process.info`, `system.info` |
 
 In normal mode, `workspace.info`, `fs.*`, `git.*`, and `shell.run` require a
@@ -290,9 +291,14 @@ For the exact READ / WRITE / EXECUTE operation matrix:
 | Find the right guide | [Documentation index](docs/README.md) |
 | Connect ChatGPT | [ChatGPT + tunnel tutorial](docs/onboarding.md) |
 | Run ChatGPT ↔ Codex reviews | [Codex review guide](docs/codex-review.md) |
+| Approve macOS Automation requests during Codex discovery | [macOS Automation permission guide](docs/macos-automation.md) |
 | Understand architecture and request flow | [System and components](docs/components.md) |
 | Understand modes, tools, READ/WRITE/EXECUTE, and boundaries | [Features and boundaries](docs/features.md) |
 | Publish a release | [Release guide](docs/releasing.md) |
+
+## License
+
+Grin is open-source software licensed under the [Apache License, Version 2.0](LICENSE).
 
 ## Development
 

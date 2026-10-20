@@ -34,12 +34,12 @@ ONE Grin MCP server
         │     selected workspace services → policy/approval/execute → TUI
 
         └── Codex review tools
-              codex.list / codex.queue / codex.turn_result
+              codex.queue / codex.turn_result
                     ↓
           explicit workspace (Normal: registered;
                               YOLO: existing target)
                     ↓
-          live-thread discovery / queued request /
+          app-server thread validation / conditional resume / queued request /
              exact persisted result lookup (~/.codex only)
 ```
 
@@ -78,7 +78,7 @@ This distinction is important in multi-workspace mode:
 | Workspace limits/shell settings | Selected `<workspace>/.grin/config.yaml` | Request | Root-bound execution behavior for that request |
 | Filesystem/runtime/Git services | Request dependency copy | Request | Execution against exactly one selected workspace |
 | Conversation workspace | ChatGPT conversation | Client-side conversation context | Which workspace path ChatGPT sends on later scoped calls |
-| Codex thread selection/request ID | ChatGPT conversation and Codex history | Client-side selection / persisted Codex history | Which live thread to queue and which exact result to retrieve |
+| Codex thread selection/request ID | ChatGPT conversation and Codex history | Client-side selection / persisted Codex history | Which exact app-server thread to resume and which result to retrieve |
 
 Grin intentionally stores no conversation-to-workspace mapping and has no
 mutable server-side `current workspace`.
@@ -174,10 +174,13 @@ existing directory outside the startup workspace.
 OS permissions, input validation, limits, timeout/cancellation, cleanup, and
 runtime correctness checks still apply.
 
-The Codex service inspects only live top-level sessions for discovery/queueing.
-Result lookup uses the default local `~/.codex` state and history files after
-validating the stored workspace; Grin keeps no thread mapping or review-loop
-state.
+The Codex service discovers terminal-title candidates and validates their
+thread eligibility against local Codex metadata. Before every queue request,
+Grin refreshes discovery and requires the user to select an eligible UUID
+when title evidence is `UNRESOLVED`, even for a single candidate. Title
+evidence does not prove the currently displayed TUI's thread. Result lookup uses the default local
+`~/.codex` state and history after validating the workspace; Grin keeps no
+thread mapping or review-loop state.
 
 See the [mode table in the README](../README.md#modes) for the user-facing
 comparison.
