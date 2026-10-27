@@ -1,11 +1,30 @@
 ObjC.import('AppKit');
 
+const terminals = [];
+const sources = [];
+const maxCandidates = 256;
+const maxSurfaces = 4096;
+let scanned = 0;
+let complete = true;
+let stopped = false;
+
 function value(object, property) {
   try {
     return object[property]();
   } catch (_) {
     return '';
   }
+}
+
+// Title reads are required identity evidence. Unlike optional metadata,
+// a failed title getter must make this provider's enumeration incomplete.
+function requiredTitle(object, property) {
+  const result = object[property]();
+  return result == null ? '' : String(result);
+}
+
+function optionalTitle(object, property) {
+  return typeof object[property] === 'function' ? requiredTitle(object, property) : '';
 }
 
 function isRunning(bundleID) {
@@ -17,13 +36,26 @@ function isRunning(bundleID) {
 }
 
 function emit(source, id, title, workspace, foreground, focused, selectedTab, windowID, tabID, activeInTab) {
-  if (!title || !/^[0-9a-f]{8}(?:-[0-9a-f]{1,4}){0,4}/i.test(title)) return;
+  if (stopped) return;
+  scanned++;
+  if (scanned > maxSurfaces) {
+    complete = false;
+    stopped = true;
+    return;
+  }
+  const text = String(title || '');
+  if (!/[0-9a-f]{8}/i.test(text)) return;
+  if (terminals.length >= maxCandidates) {
+    complete = false;
+    stopped = true;
+    return;
+  }
   terminals.push({
     api: source,
     terminal_id: String(id),
     window_id: windowID ? String(windowID) : undefined,
     tab_id: tabID ? String(tabID) : undefined,
-    title: String(title),
+    title: text,
     workspace: String(workspace || ''),
     foreground: Boolean(foreground),
     focused: Boolean(focused),
@@ -32,16 +64,14 @@ function emit(source, id, title, workspace, foreground, focused, selectedTab, wi
   });
 }
 
-const terminals = [];
-const sources = [];
-
 try {
   if (isRunning('com.mitchellh.ghostty')) {
     const app = Application('Ghostty');
+    const windows = app.windows();
+    sources.push('ghostty');
     const frontmost = Boolean(value(app, 'frontmost'));
     const frontWindowID = frontmost ? value(app, 'frontWindow').id() : null;
-    sources.push('ghostty');
-    for (const window of app.windows()) {
+    for (const window of windows) {
       const windowID = String(value(window, 'id'));
       const foreground = frontmost && windowID === String(frontWindowID);
       for (const tab of window.tabs()) {
@@ -52,73 +82,79 @@ try {
         for (const terminal of tab.terminals()) {
           const terminalID = String(value(terminal, 'id'));
           const activeInTab = focusedID ? terminalID === focusedID : undefined;
-          emit('ghostty-applescript', terminalID, value(terminal, 'name'),
+          emit('ghostty-applescript', terminalID, requiredTitle(terminal, 'name'),
             value(terminal, 'workingDirectory'), foreground,
             foreground && selected && activeInTab === true, selected,
             windowID, tabID, activeInTab);
-          if (terminals.length >= 256) break;
+          if (stopped) break;
         }
-        if (terminals.length >= 256) break;
+        if (stopped) break;
       }
-      if (terminals.length >= 256) break;
+      if (stopped) break;
     }
   }
 } catch (_) {
   sources.push('ghostty-unavailable');
+  complete = false;
 }
 
 try {
-  if (isRunning('com.apple.Terminal') && terminals.length < 256) {
+  if (!stopped && isRunning('com.apple.Terminal')) {
     const app = Application('Terminal');
-    const frontmost = Boolean(value(app, 'frontmost'));
+    const windows = app.windows();
     sources.push('terminal-app');
-    for (const window of app.windows()) {
+    const frontmost = Boolean(value(app, 'frontmost'));
+    for (const window of windows) {
       const windowID = String(value(window, 'id'));
       const foreground = frontmost && Boolean(value(window, 'frontmost'));
-      const windowTitle = String(value(window, 'name'));
       for (const tab of window.tabs()) {
         const selected = Boolean(value(tab, 'selected'));
         const tty = String(value(tab, 'tty'));
-        const customTitle = String(value(tab, 'customTitle'));
+        const customTitle = optionalTitle(tab, 'customTitle');
+        const title = customTitle || (selected ? requiredTitle(window, 'name') : '');
         emit('terminal-app-applescript', `window:${windowID}/tty:${tty}`,
-          customTitle || (selected ? windowTitle : ''), '', foreground,
+          title, '', foreground,
           foreground && selected, selected);
-        if (terminals.length >= 256) break;
+        if (stopped) break;
       }
-      if (terminals.length >= 256) break;
+      if (stopped) break;
     }
   }
 } catch (_) {
   sources.push('terminal-app-unavailable');
+  complete = false;
 }
 
 try {
-  if (isRunning('com.googlecode.iterm2') && terminals.length < 256) {
+  if (!stopped && isRunning('com.googlecode.iterm2')) {
     const app = Application('iTerm');
-    const frontmost = Boolean(value(app, 'frontmost'));
+    const windows = app.windows();
     sources.push('iterm2');
-    for (const window of app.windows()) {
+    const frontmost = Boolean(value(app, 'frontmost'));
+    for (const window of windows) {
       const windowID = String(value(window, 'id'));
       const foreground = frontmost && Boolean(value(window, 'frontmost'));
       for (const tab of window.tabs()) {
         const selectedSession = value(tab, 'currentSession');
         const selectedID = selectedSession ? String(value(selectedSession, 'id')) : '';
-        const tabTitle = String(value(tab, 'title'));
+        const tabTitle = requiredTitle(tab, 'title');
         for (const session of tab.sessions()) {
           const sessionID = String(value(session, 'id'));
           emit('iterm2-applescript', `window:${windowID}/session:${sessionID}`,
             tabTitle, '', foreground, foreground && sessionID === selectedID);
-          if (terminals.length >= 256) break;
+          if (stopped) break;
         }
-        if (terminals.length >= 256) break;
+        if (stopped) break;
       }
-      if (terminals.length >= 256) break;
+      if (stopped) break;
     }
   }
 } catch (_) {
   sources.push('iterm2-unavailable');
+  complete = false;
 }
 
-JSON.stringify({ supported: sources.some(source => !source.endsWith('-unavailable')),
+const supported = sources.some(source => !source.endsWith('-unavailable'));
+JSON.stringify({ supported: supported, complete: complete && supported,
   reason: sources.length ? sources.join(', ') : 'no supported terminal app is running',
   terminals: terminals, sources: sources });

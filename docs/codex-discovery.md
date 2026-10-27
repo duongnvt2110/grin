@@ -6,18 +6,23 @@ sends terminal input and never queues a Codex request.
 The top-level `sources` array identifies the native interfaces that supplied
 evidence (or the unsupported desktop context, such as Wayland).
 
-The title's leading UUID or UUID prefix is the identity candidate. If the next
-title component contains a valid full UUID beginning with that prefix, Grin
-tries a read-only app-server `thread/read` directly, even when SQLite has no
-record yet. The full UUID is retained as `unverified_title_uuid` if the
-app-server cannot corroborate it; this is not an eligible or verified thread.
-Descriptive titles without a full UUID keep the SQLite prefix resolution path.
-A conflicting full UUID instead yields `title_uuid_mismatch` and never falls
-back to an older prefix match.
-The title's thread name and project name are returned only as corroborating
-context. Terminal workspace and the Codex-state workspace are separate fields;
-`workspace_match` is `yes` only when available workspace values match, and
-`state_only` when the terminal API has no workspace field.
+Grin extracts a **standalone full Codex UUID or a uniquely resolvable UUID
+prefix at any position** in a terminal title. The `|` field order is not
+significant. Extraction runs only after title redaction, including the first
+field and inline credentials. UUIDs in credentials, URLs, or filesystem paths
+are not thread identity evidence. Conflicting full IDs or inconsistent prefixes
+are discarded rather than selecting a guessed recipient.
+
+A full UUID is checked using read-only app-server `thread/read` when available;
+SQLite metadata provides separate workspace, archive, source, and prefix
+corroboration. If the app-server cannot establish top-level eligibility, a
+matching title alone is not an eligible or verified thread. Prefix-only titles
+must resolve to exactly one eligible local state record.
+Descriptive title components are not assigned a verified thread name or project
+name merely from their positions. When independently corroborated labels are
+unavailable, selection uses the thread UUID and terminal ID. Terminal workspace
+and Codex-state workspace are separate evidence; `workspace_match` can be
+`state_only` if no terminal workspace is available.
 
 On macOS, Grin runs the embedded terminal script through `osascript`. The
 first query to a running terminal app may produce an **Automation** permission
@@ -46,11 +51,21 @@ process-to-window correlation are not used because the available implementation
 has no verified cross-terminal association for those signals.
 
 If the native title API or required local metadata is unavailable, the result
-is `UNSUPPORTED` or `UNRESOLVED` with evidence. Prefix collisions, archived
-threads, and threads that are not user-originated remain ineligible. Candidates
-with a known workspace mismatch are omitted from the default output. Missing
-workspace metadata is reported as unknown and does not by itself discard a
-candidate.
+is `UNSUPPORTED` or `UNRESOLVED` with evidence. The JSON `complete` field
+is separate from `status`: it is true only when at least one applicable source
+was successfully enumerated and all applicable sources were read exhaustively.
+A terminal app that is not running, or an optional tmux scope that is absent,
+does not make an otherwise exhaustive scan incomplete. An attempted source
+that fails, times out, or reaches a scan/output limit does. Successful partial
+fallback observations may still appear for diagnostics, but `codex.queue`
+refuses **both explicitly selected and omitted thread IDs** when
+`complete=false`. Missing/legacy completeness signals also fail closed.
+This is not proof that a title is fresh after `/new`, `/clear`, or `/resume`.
+
+Prefix collisions, archived threads, and threads that are not user-originated
+remain ineligible. Candidates with a known workspace mismatch are omitted
+from the default output. Missing workspace metadata is reported as unknown
+and does not by itself make a candidate eligible.
 
 Every candidate with a matching full UUID or uniquely resolved local state
 record is checked with a read-only local app-server `thread/read` when available.

@@ -14,7 +14,7 @@ import (
 
 // These tests execute the bundled Linux shell script with bounded fake native
 // commands. They do not need an X server or a running tmux service.
-func runLinuxScriptFixture(t *testing.T, env map[string]string, binaries map[string]string) ([]TerminalObservation, []string, bool, string, error) {
+func runLinuxScriptFixture(t *testing.T, env map[string]string, binaries map[string]string) ([]TerminalObservation, []string, bool, bool, string, error) {
 	t.Helper()
 	binDir := t.TempDir()
 	for name, script := range binaries {
@@ -59,12 +59,12 @@ esac
 `
 
 func TestLinuxScriptX11EnumeratesTwoWindowsWithoutAssumingTabIdentity(t *testing.T) {
-	observations, sources, supported, reason, err := runLinuxScriptFixture(t,
+	observations, sources, supported, complete, reason, err := runLinuxScriptFixture(t,
 		map[string]string{"DISPLAY": ":42", "XDG_SESSION_TYPE": "x11"},
 		map[string]string{"xprop": fakeLinuxXprop},
 	)
-	if err != nil || !supported || reason != "" || len(observations) != 2 {
-		t.Fatalf("X11 script = %#v, sources %v, supported %v, reason %q, err %v", observations, sources, supported, reason, err)
+	if err != nil || !supported || !complete || reason != "" || len(observations) != 2 {
+		t.Fatalf("X11 script = %#v, sources %v, supported %v, complete %v, reason %q, err %v", observations, sources, supported, complete, reason, err)
 	}
 	if !slices.Contains(sources, "x11-ewmh") {
 		t.Fatalf("missing X11 source: %v", sources)
@@ -89,30 +89,31 @@ func TestLinuxScriptDesktopBoundaries(t *testing.T) {
 		env         map[string]string
 		binaries    map[string]string
 		supported   bool
+		complete    bool
 		wantSources []string
 		wantCount   int
 		wantReason  string
 	}{
 		{
 			name: "Wayland without X11", env: map[string]string{"WAYLAND_DISPLAY": "wayland-0", "XDG_SESSION_TYPE": "wayland"},
-			supported: false, wantSources: []string{"wayland"}, wantReason: "Wayland",
+			supported: false, complete: false, wantSources: []string{"wayland"}, wantReason: "Wayland",
 		},
 		{
 			name:      "Wayland with XWayland is only X11 coverage",
 			env:       map[string]string{"WAYLAND_DISPLAY": "wayland-0", "XDG_SESSION_TYPE": "wayland", "DISPLAY": ":42"},
 			binaries:  map[string]string{"xprop": fakeLinuxXprop},
-			supported: true, wantSources: []string{"wayland", "x11-ewmh"}, wantCount: 2,
+			supported: true, complete: true, wantSources: []string{"wayland", "x11-ewmh"}, wantCount: 2,
 		},
 		{
 			name: "No usable X11 API", env: map[string]string{"DISPLAY": ":42", "XDG_SESSION_TYPE": "x11"},
 			binaries:  map[string]string{"xprop": "#!/bin/sh\nexit 1\n"},
-			supported: false, wantReason: "No usable X11",
+			supported: false, complete: false, wantReason: "No usable X11",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			observations, sources, supported, reason, err := runLinuxScriptFixture(t, tt.env, tt.binaries)
-			if err != nil || supported != tt.supported || len(observations) != tt.wantCount {
-				t.Fatalf("Linux script = %#v, sources %v, supported %v, reason %q, err %v", observations, sources, supported, reason, err)
+			observations, sources, supported, complete, reason, err := runLinuxScriptFixture(t, tt.env, tt.binaries)
+			if err != nil || supported != tt.supported || complete != tt.complete || len(observations) != tt.wantCount {
+				t.Fatalf("Linux script = %#v, sources %v, supported %v, complete %v, reason %q, err %v", observations, sources, supported, complete, reason, err)
 			}
 			for _, source := range tt.wantSources {
 				if !slices.Contains(sources, source) {
@@ -142,15 +143,15 @@ esac
 `
 
 func TestLinuxScriptTmuxOnlyInheritedSession(t *testing.T) {
-	observations, sources, supported, reason, err := runLinuxScriptFixture(t,
+	observations, sources, supported, complete, reason, err := runLinuxScriptFixture(t,
 		map[string]string{
 			"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0",
 			"TMUX": "/tmp/grin-test.sock,12345,7", "TMUX_PANE": "%12",
 		},
 		map[string]string{"tmux": fakeLinuxTmux},
 	)
-	if err != nil || !supported || len(observations) != 2 || reason != "" {
-		t.Fatalf("tmux script = %#v, sources %v, supported %v, reason %q, err %v", observations, sources, supported, reason, err)
+	if err != nil || !supported || !complete || len(observations) != 2 || reason != "" {
+		t.Fatalf("tmux script = %#v, sources %v, supported %v, complete %v, reason %q, err %v", observations, sources, supported, complete, reason, err)
 	}
 	if !slices.Contains(sources, "tmux-current-session") || !slices.Contains(sources, "wayland") {
 		t.Fatalf("expected scoped tmux and Wayland evidence, got %v", sources)
@@ -166,15 +167,15 @@ func TestLinuxScriptRejectsUnscopedTmuxEnvironment(t *testing.T) {
 		t.Run(value, func(t *testing.T) {
 			marker := filepath.Join(t.TempDir(), "tmux-invoked")
 			fake := "#!/bin/sh\nprintf 'invoked' > '" + marker + "'\nexit 1\n"
-			observations, _, supported, reason, err := runLinuxScriptFixture(t,
+			observations, _, supported, complete, reason, err := runLinuxScriptFixture(t,
 				map[string]string{
 					"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0",
 					"TMUX": value, "TMUX_PANE": "%12",
 				},
 				map[string]string{"tmux": fake},
 			)
-			if err != nil || supported || len(observations) != 0 || !strings.Contains(reason, "Wayland") {
-				t.Fatalf("unscoped tmux %q yielded %#v, supported %v, reason %q, err %v", value, observations, supported, reason, err)
+			if err != nil || supported || complete || len(observations) != 0 || !strings.Contains(reason, "Wayland") {
+				t.Fatalf("unscoped tmux %q yielded %#v, supported %v, complete %v, reason %q, err %v", value, observations, supported, complete, reason, err)
 			}
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
 				t.Fatalf("unscoped tmux %q invoked an external tmux command: %v", value, err)
@@ -183,9 +184,28 @@ func TestLinuxScriptRejectsUnscopedTmuxEnvironment(t *testing.T) {
 	}
 }
 
+func TestLinuxParserMalformedX11TitleNeverClaimsComplete(t *testing.T) {
+	const valid = "x11-ewmh\t0x10001\ttrue\tfalse\t\t_NET_WM_NAME(UTF8_STRING) = \"01a14001-2537-76e0-92d6-91eba1234567 | grin\"\n"
+	const malformed = "x11-ewmh\t0x10002\tfalse\tfalse\t\t_NET_WM_NAME(UTF8_STRING) = \"unterminated title\n"
+	for _, tc := range []struct {
+		name, output string
+	}{
+		{"marker after bad title", "SOURCE\tx11-ewmh\n" + valid + malformed + "SUPPORTED\nCOMPLETE\ttrue\n"},
+		{"marker before bad title", "SOURCE\tx11-ewmh\nCOMPLETE\ttrue\n" + valid + malformed + "SUPPORTED\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observations, _, supported, complete, _, err := parseTerminalOutput("linux", []byte(tc.output))
+			if err != nil || !supported || complete || len(observations) != 1 || observations[0].ID != "0x10001" {
+				t.Fatalf("malformed X11 title must fail closed: observations=%#v supported=%t complete=%t err=%v",
+					observations, supported, complete, err)
+			}
+		})
+	}
+}
+
 func TestLinuxParserRejectsMalformedScriptData(t *testing.T) {
-	_, _, supported, _, err := parseTerminalOutput("linux", []byte("SOURCES\nbroken-record\nSUPPORTED\n"))
-	if err == nil || supported {
-		t.Fatalf("malformed script record accepted: supported %v, err %v", supported, err)
+	_, _, supported, complete, _, err := parseTerminalOutput("linux", []byte("SOURCES\nbroken-record\nSUPPORTED\n"))
+	if err == nil || supported || complete {
+		t.Fatalf("malformed script record accepted: supported %v, complete %v, err %v", supported, complete, err)
 	}
 }

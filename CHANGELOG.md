@@ -2,6 +2,23 @@
 
 All notable Grin changes are documented here.
 
+## 0.4.1 - 2026-10-27
+
+### Added
+
+- Stable MCP tool schemas across Normal and YOLO modes, with explicit YOLO
+  workspace routing for scoped tools and registry-backed `workspace.list`.
+- Position-independent Codex thread-ID discovery from terminal titles while
+  retaining explicit recipient selection and fail-closed handling of incomplete
+  discovery.
+
+### Fixed
+
+- Redacted inline credentials before Codex title identity extraction and
+  serialized discovery output.
+- Marked malformed or incomplete terminal enumeration as incomplete so it
+  cannot authorize a Codex queue request.
+
 ## 0.4.0 - 2026-10-20
 
 ### Added

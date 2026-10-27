@@ -8,12 +8,12 @@ implementation. For installation and CLI usage, start with the
 
 | Behavior | Normal mode | `--yolo` |
 | --- | --- | --- |
-| Workspace model | Multiple registered workspaces | One startup workspace |
-| `workspace.list` | Available | Available for compatibility; returns the startup workspace |
-| Workspace selector on filesystem/Git/shell tools | Required | Not required |
+| Workspace model | Multiple registered workspaces | Startup workspace by default; explicit requests may select any existing canonical directory |
+| `workspace.list` | Registered workspaces | Registered workspaces |
+| Workspace selector on `workspace.info`, filesystem/Git/shell tools | Optional in schema; required at runtime and must be registered | Optional; omission uses startup workspace |
 | Workspace on Codex tools | Required; must be registered | Required; any existing target |
-| Registry routing | Registered canonical path after lexical cleaning | Not used |
-| Per-workspace configuration | Loaded for each selected request | Startup workspace configuration |
+| Registry routing | Required for scoped tools | Not required for explicit scoped targets |
+| Per-workspace configuration | Loaded for each selected request | Startup limits and shell settings; target config is not loaded |
 | Grin policy/approval | Active | Bypassed for supported tools |
 | Workspace containment | Active according to normal policy | Bypassed |
 | OS/runtime safety limits | Active | Active |
@@ -28,7 +28,7 @@ The former `limits.max_concurrent_requests` setting was unused and has been remo
 
 | Tool | Purpose | Normal | YOLO |
 | --- | --- | --- | --- |
-| `workspace.list` | Return registered canonical workspaces, or the YOLO startup workspace for compatibility | Yes | Yes |
+| `workspace.list` | Return registered canonical workspaces | Yes | Yes |
 | `process.list` | Return bounded/redacted process metadata | Yes | Yes |
 | `process.info` | Inspect one process with bounded/redacted metadata | Yes | Yes |
 | `system.info` | Return non-secret OS/system information | Yes | Yes |
@@ -116,7 +116,7 @@ selected workspace.
 
 | Class | Tools | Effect |
 | --- | --- | --- |
-| Discovery/compatibility | `workspace.list` | Reads the normal-mode registry, or returns the YOLO startup workspace without routing. |
+| Discovery/compatibility | `workspace.list` | Reads the registered workspace list in both modes. |
 | Codex session | `codex.queue`, `codex.turn_result` | Validates and queues an exact app-server thread, resuming only when required. |
 | Workspace read | `workspace.info` | Reads selected-workspace metadata. |
 | Filesystem read | `fs.list`, `fs.stat`, `fs.read_text`, `fs.search` | Reads or searches filesystem content/metadata. |
@@ -145,7 +145,7 @@ workspace and approval restrictions for supported tools.
 | `codex.queue` | validated registered workspace and exact thread | ALLOW |
 | `git.*` | selected workspace | ALLOW |
 | `process.*`, `system.info` | host/global | ALLOW |
-| `fs.list/stat/read_text/search` | inside selected workspace | Execute after validation; no policy decision on this path |
+| `fs.list/stat/read_text/search` | inside selected workspace | Policy ALLOW after validation |
 | `fs.list/stat/read_text/search` | outside selected workspace | ALLOW |
 | `fs.write_text`, `fs.edit_text` | inside selected workspace | ALLOW |
 | `fs.write_text`, `fs.edit_text` | outside selected workspace | ASK |
@@ -153,13 +153,10 @@ workspace and approval restrictions for supported tools.
 | `shell.run` | outside selected workspace | ASK |
 | `shell.run` | inside selected workspace, destructive | ASK |
 
-`workspace.list` is different from the other reads: it is pre-selection
-registry discovery and does not use workspace-scoped policy evaluation.
-
-The filesystem-read row above intentionally documents the **current execution
-path**: inside-workspace filesystem reads are validated and executed directly;
-policy evaluation for those tools currently occurs only when the target is
-classified outside the selected workspace.
+`workspace.list` is different from the other reads: it is global registry
+discovery and does not use workspace-scoped policy evaluation. Filesystem
+reads publish their policy decision after path classification; the built-in
+Normal policy allows reads inside the selected workspace.
 
 ### Write/execute flow
 
@@ -206,22 +203,28 @@ YOLO does **not** make unsupported tools valid and does not bypass operating
 system permissions, input validation, output/resource limits, cancellation, or
 process cleanup.
 
-`workspace.list` remains available in YOLO only for conversations that cached
-the normal-mode tool catalog. It returns the configured startup workspace and
-does not enable multi-workspace routing. A stale `workspace` argument is
-accepted only when it matches that startup root.
+`workspace.list` returns registered workspaces in both modes. YOLO scoped tools
+use the startup workspace when `workspace` is omitted. An explicit workspace
+may be any existing canonical absolute directory, whether registered or not;
+Grin uses the startup workspace limits and shell settings and does not load the
+target's `.grin/config.yaml`. Invalid explicit paths fail without falling back.
 
-Codex tools are the exception to YOLO's single-startup-workspace tool routing:
-they require an explicit target workspace and may target another existing
-workspace. They still use live-thread matching and the default `~/.codex`
-history boundary.
+Codex tools still require an explicit target workspace and retain their
+existing live-thread matching and default `~/.codex` history boundary.
+
+After upgrading to the unified tool schemas, refresh the ChatGPT connector's
+tool catalog once. Switching modes afterward does not require another schema
+refresh; a server or tunnel restart may still interrupt and reconnect the
+transport.
 
 ## Workspace routing
 
 `grin init` registers canonical workspace paths in `~/.grin/config.yaml`.
-Normal-mode scoped tool calls must use an absolute path that, after lexical
+Normal-mode scoped tool calls must include an absolute path that, after lexical
 cleaning, matches one of those registered canonical paths. Symlink aliases are
-rejected.
+rejected. YOLO scoped tools may omit the path to use the startup workspace, or
+provide any existing canonical absolute directory; explicit symlink aliases
+are rejected.
 
 Grin does not:
 
@@ -231,8 +234,11 @@ Grin does not:
 - map ChatGPT conversation IDs to workspaces;
 - create a separate MCP server per workspace.
 
-The registry is read when `workspace.list` or a scoped request needs it, so a
-new `grin init` registration is visible without restarting Grin.
+The registry is read by `workspace.list` in both modes and by Normal-mode
+scoped requests. A new `grin init` registration is visible without restarting
+Grin; YOLO explicit targets do not need to be registered.
+If the registry is missing, `workspace.list` returns an empty list. If it is
+unreadable or malformed, it returns `workspace_unavailable`.
 
 ## Current safety behavior
 

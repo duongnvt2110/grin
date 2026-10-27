@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"grin/internal/redaction"
 )
@@ -18,16 +20,22 @@ import (
 var terminalDiscoveryScripts embed.FS
 
 const (
-	discoveryTimeout    = 20 * time.Second
-	terminalReadTimeout = 12 * time.Second
-	darwinReadTimeout   = 15 * time.Second
-	darwinTitleTimeout  = 10 * time.Second
-	tmuxProbeTimeout    = 5 * time.Second
-	maxDiscoveryOutput  = 1 << 20
-	maxTerminalWindows  = 256
+	discoveryTimeout     = 20 * time.Second
+	terminalReadTimeout  = 12 * time.Second
+	darwinReadTimeout    = 15 * time.Second
+	darwinTitleTimeout   = 10 * time.Second
+	tmuxProbeTimeout     = 5 * time.Second
+	maxDiscoveryOutput   = 1 << 20
+	maxTerminalWindows   = 256
+	maxDiscoverySurfaces = 4096
 )
 
-var leadingUUIDPrefix = regexp.MustCompile(`(?i)^([0-9a-f]{8}(?:-[0-9a-f]{4}){0,3}(?:-[0-9a-f]{1,12})?)(?:\.\.\.|…|[\s|]|$)`)
+var (
+	identityStartPattern = regexp.MustCompile(`(?i)[0-9a-f]{8}`)
+	urlSpanPattern       = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s|]+`)
+	unixPathSpanPattern  = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.-])(/[^\s|]+)`)
+	windowsPathPattern   = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_.-])(?:[a-z]:\\|\\\\)[^\s|]+`)
+)
 
 type TerminalObservation struct {
 	API         string `json:"api"`
@@ -56,6 +64,7 @@ type ThreadCandidate struct {
 
 type DiscoveryResult struct {
 	Status     string            `json:"status"`
+	Complete   bool              `json:"complete"`
 	Workspace  string            `json:"workspace,omitempty"`
 	Reason     string            `json:"reason,omitempty"`
 	Evidence   []string          `json:"evidence"`
@@ -65,6 +74,7 @@ type DiscoveryResult struct {
 
 type terminalSnapshot struct {
 	Supported bool                  `json:"supported"`
+	Complete  bool                  `json:"complete"`
 	Reason    string                `json:"reason,omitempty"`
 	Terminals []TerminalObservation `json:"terminals"`
 	Sources   []string              `json:"sources,omitempty"`
@@ -92,8 +102,9 @@ func (s *Service) Discover(ctx context.Context, workspace string) (DiscoveryResu
 		Sources:    []string{},
 		Candidates: []ThreadCandidate{},
 	}
-	observations, sources, supported, reason, err := readTerminalTitles(ctx, runtime.GOOS)
+	observations, sources, supported, complete, reason, err := readTerminalTitles(ctx, runtime.GOOS)
 	result.Sources = sources
+	result.Complete = complete
 	if err != nil {
 		if ctx.Err() != nil {
 			return DiscoveryResult{}, ctx.Err()
@@ -110,7 +121,7 @@ func (s *Service) Discover(ctx context.Context, workspace string) (DiscoveryResu
 		result.Evidence = append(result.Evidence, "native terminal title enumeration is unavailable")
 		return result, nil
 	}
-	result, err = s.discoverFromTitles(ctx, canonical, observations)
+	result, err = s.discoverFromTitles(ctx, canonical, observations, complete)
 	result.Sources = sources
 	return result, err
 }
@@ -122,9 +133,10 @@ func terminalReadFailure(err error) (reason, evidence string) {
 	return "terminal title enumeration failed", "native terminal title API could not be read"
 }
 
-func (s *Service) discoverFromTitles(ctx context.Context, canonical string, observations []TerminalObservation) (DiscoveryResult, error) {
+func (s *Service) discoverFromTitles(ctx context.Context, canonical string, observations []TerminalObservation, complete bool) (DiscoveryResult, error) {
 	result := DiscoveryResult{
 		Status:     "UNRESOLVED",
+		Complete:   complete,
 		Workspace:  canonical,
 		Evidence:   []string{},
 		Sources:    []string{},
@@ -132,32 +144,31 @@ func (s *Service) discoverFromTitles(ctx context.Context, canonical string, obse
 	}
 	result.Evidence = append(result.Evidence, "terminal titles were read through the operating system API")
 
+	conflictingTitles := 0
 	for _, terminal := range observations {
-		prefix, threadTitle, projectName, ok := parseThreadTitle(terminal.Title)
-		if !ok {
+		identity := extractTitleIdentity(terminal.Title)
+		if identity.conflict {
+			conflictingTitles++
+			continue
+		}
+		if identity.prefix == "" {
 			continue
 		}
 		candidate := ThreadCandidate{
 			TerminalObservation: TerminalObservation{
-				API: terminal.API, ID: terminal.ID, Title: sanitizeTerminalTitle(terminal.Title),
+				API: terminal.API, ID: terminal.ID, Title: identity.safeTitle,
 				WindowID: terminal.WindowID, TabID: terminal.TabID,
 				Workspace: terminal.Workspace, Foreground: terminal.Foreground, Focused: terminal.Focused,
 				SelectedTab: terminal.SelectedTab, ActiveInTab: terminal.ActiveInTab,
 			},
-			UUIDPrefix:     prefix,
-			ThreadTitle:    sanitizeDiscoveryText(threadTitle),
-			ProjectName:    sanitizeDiscoveryText(projectName),
+			UUIDPrefix:     identity.prefix,
+			ThreadID:       identity.threadID,
 			WorkspaceMatch: "unknown",
 			TopLevel:       "unknown",
 			Resolution:     "metadata_unavailable",
 		}
-		if threadID, ok := titleThreadID(terminal.Title); ok {
-			if strings.HasPrefix(threadID, prefix) {
-				candidate.ThreadID = threadID
-				candidate.Resolution = "unverified_title_uuid"
-			} else {
-				candidate.Resolution = "title_uuid_mismatch"
-			}
+		if candidate.ThreadID != "" {
+			candidate.Resolution = "unverified_title_uuid"
 		}
 		if terminal.Workspace != "" {
 			if terminalWorkspace, err := canonicalWorkspace(terminal.Workspace); err == nil && terminalWorkspace != canonical {
@@ -169,6 +180,9 @@ func (s *Service) discoverFromTitles(ctx context.Context, canonical string, obse
 	}
 	workspaceCandidates, filteredCount := filterWorkspaceCandidates(result.Candidates)
 	result.Candidates = workspaceCandidates
+	if conflictingTitles > 0 {
+		result.Evidence = append(result.Evidence, "conflicting or ambiguous thread identities were excluded")
+	}
 	if filteredCount > 0 {
 		result.Evidence = append(result.Evidence, "known workspace-mismatched terminal titles were excluded from output")
 	}
@@ -176,7 +190,7 @@ func (s *Service) discoverFromTitles(ctx context.Context, canonical string, obse
 		if filteredCount > 0 {
 			result.Reason = "terminal title candidates did not match the requested workspace"
 		} else {
-			result.Reason = "no terminal title began with a Codex thread UUID"
+			result.Reason = "no unambiguous Codex thread identity was present in terminal titles"
 		}
 		result.Evidence = append(result.Evidence, "thread title and project name are corroborating context only")
 		return result, nil
@@ -240,11 +254,29 @@ func (s *Service) discoverFromTitles(ctx context.Context, canonical string, obse
 		candidate := &result.Candidates[index]
 		if candidate.ThreadID != "" {
 			rows, queryErr := queryRows[discoveryThreadRow](ctx, s.sqlite, stateDB, threadExactQuery(candidate.ThreadID))
-			if queryErr == nil {
-				row, resolution := uniqueThreadRow(rows)
-				if resolution == "" && row.Archived != 0 {
-					candidate.Resolution = "archived_title"
-					candidate.TopLevel = "unknown"
+			if queryErr != nil {
+				continue
+			}
+			row, resolution := uniqueThreadRow(rows)
+			if resolution != "" {
+				continue
+			}
+			if row.Archived != 0 {
+				candidate.Resolution = "archived_title"
+				candidate.TopLevel = "unknown"
+				continue
+			}
+			if candidate.Resolution != "title_uuid_correlated" {
+				// A title UUID alone is not proof of an eligible workspace/thread.
+				// Reuse the same SQLite eligibility checks as prefix-only titles.
+				needsTopLevelCheck(candidate, row, canonical)
+			} else if row.ThreadSource != "user" {
+				candidate.TopLevel = "no"
+				candidate.Resolution = "ineligible_thread_source"
+			} else if row.CWD != "" {
+				if stateWorkspace, workspaceErr := canonicalWorkspace(row.CWD); workspaceErr == nil && stateWorkspace != canonical {
+					candidate.WorkspaceMatch = "no"
+					candidate.Resolution = "workspace_mismatch"
 				}
 			}
 			continue
@@ -309,15 +341,8 @@ func (s *Service) discoverFromTitles(ctx context.Context, canonical string, obse
 }
 
 func titleThreadID(title string) (string, bool) {
-	parts := strings.Split(title, "|")
-	if len(parts) < 2 {
-		return "", false
-	}
-	threadID := strings.TrimSpace(parts[1])
-	if !validThreadID(threadID) {
-		return "", false
-	}
-	return strings.ToLower(threadID), true
+	identity := extractTitleIdentity(title)
+	return identity.threadID, identity.threadID != "" && !identity.conflict
 }
 
 func filterWorkspaceCandidates(candidates []ThreadCandidate) ([]ThreadCandidate, int) {
@@ -334,11 +359,8 @@ func filterWorkspaceCandidates(candidates []ThreadCandidate) ([]ThreadCandidate,
 }
 
 func sanitizeTerminalTitle(title string) string {
-	parts := strings.Split(title, "|")
-	for index := 1; index < len(parts); index++ {
-		parts[index] = sanitizeDiscoveryText(strings.TrimSpace(parts[index]))
-	}
-	return strings.Join(parts, " | ")
+	safe, _ := sanitizeTitle(title)
+	return safe
 }
 
 func sanitizeDiscoveryText(value string) string {
@@ -436,34 +458,209 @@ func threadExactQuery(threadID string) string {
 }
 
 func parseThreadTitle(title string) (prefix, threadTitle, projectName string, ok bool) {
-	match := leadingUUIDPrefix.FindStringSubmatch(title)
-	if len(match) != 2 {
+	identity := extractTitleIdentity(title)
+	if identity.conflict || identity.prefix == "" {
 		return "", "", "", false
 	}
-	prefix = strings.ToLower(match[1])
-	compact := strings.ReplaceAll(prefix, "-", "")
+	return identity.prefix, "", "", true
+}
+
+type titleIdentity struct {
+	prefix    string
+	threadID  string
+	safeTitle string
+	conflict  bool
+}
+
+func extractTitleIdentity(title string) titleIdentity {
+	identity := titleIdentity{}
+	identity.safeTitle, _ = sanitizeTitle(title)
+	if redaction.ContainsPrivateKey(title) {
+		return identity
+	}
+
+	fullIDs := make(map[string]bool)
+	prefixes := make(map[string]bool)
+	for _, component := range strings.Split(identity.safeTitle, "|") {
+		component = strings.TrimSpace(component)
+		for _, line := range strings.Split(component, "\n") {
+			urlSpans := urlSpanPattern.FindAllStringIndex(line, -1)
+			pathSpans := append(unixPathSpanPattern.FindAllStringIndex(line, -1), windowsPathPattern.FindAllStringIndex(line, -1)...)
+			excluded := append(urlSpans, pathSpans...)
+			for _, start := range identityStartPattern.FindAllStringIndex(line, -1) {
+				if !titleTokenStartBoundary(line, start[0]) || inSpan(start[0], excluded) {
+					continue
+				}
+				token, compact, end, ellipsis, ok := readUUIDPrefix(line, start[0])
+				if !ok || !titleTokenEndBoundary(line, end) || inSpan(start[0], excluded) {
+					continue
+				}
+				if len(compact) == 8 && !ellipsis && strings.TrimSpace(line) != token {
+					continue
+				}
+				if validThreadID(token) {
+					fullIDs[strings.ToLower(token)] = true
+				} else if len(compact) >= 8 && len(compact) < 32 {
+					prefixes[compact] = true
+				}
+			}
+		}
+	}
+
+	if len(fullIDs) > 1 {
+		identity.conflict = true
+		return identity
+	}
+	if len(fullIDs) == 1 {
+		for id := range fullIDs {
+			compactID := strings.ReplaceAll(id, "-", "")
+			for prefix := range prefixes {
+				if !strings.HasPrefix(compactID, prefix) {
+					identity.conflict = true
+					return identity
+				}
+			}
+			identity.threadID = id
+			identity.prefix = id
+			return identity
+		}
+	}
+	if len(prefixes) == 0 {
+		return identity
+	}
+	longest := ""
+	for prefix := range prefixes {
+		if len(prefix) > len(longest) {
+			longest = prefix
+		}
+	}
+	for prefix := range prefixes {
+		if !strings.HasPrefix(longest, prefix) {
+			identity.conflict = true
+			return identity
+		}
+	}
+	identity.prefix = canonicalPrefix(longest)
+	return identity
+}
+
+func sanitizeTitle(title string) (string, bool) {
+	if redaction.ContainsPrivateKey(title) {
+		return "<redacted>", false
+	}
+	parts := strings.Split(title, "|")
+	for index := range parts {
+		parts[index] = sanitizeDiscoveryText(strings.TrimSpace(parts[index]))
+	}
+	return strings.Join(parts, " | "), true
+}
+
+func readUUIDPrefix(value string, start int) (token, compact string, end int, ellipsis, ok bool) {
+	index := start
+	for count := 0; count < 8; count++ {
+		if index >= len(value) || !isHex(value[index]) {
+			return "", "", start, false, false
+		}
+		index++
+	}
+	compact = strings.ToLower(value[start:index])
+	groupSizes := []int{4, 4, 4, 12}
+	for _, maxGroup := range groupSizes {
+		if index >= len(value) || value[index] != '-' {
+			break
+		}
+		index++
+		groupStart := index
+		for index < len(value) && index-groupStart < maxGroup && isHex(value[index]) {
+			index++
+		}
+		if index == groupStart {
+			return "", "", start, false, false
+		}
+		compact += strings.ToLower(value[groupStart:index])
+		if index-groupStart < maxGroup {
+			break
+		}
+	}
+	if strings.HasPrefix(value[index:], "...") {
+		index += 3
+		ellipsis = true
+	} else if strings.HasPrefix(value[index:], "…") {
+		index += len("…")
+		ellipsis = true
+	}
+	token = strings.ToLower(value[start:index])
+	if ellipsis {
+		token = strings.TrimSuffix(token, "...")
+		token = strings.TrimSuffix(token, "…")
+	}
 	if len(compact) < 8 || len(compact) > 32 {
-		return "", "", "", false
+		return "", "", start, false, false
 	}
-	remainder := strings.TrimSpace(title[len(match[1]):])
-	if strings.HasPrefix(remainder, "...") {
-		remainder = strings.TrimPrefix(remainder, "...")
+	if len(compact) == 32 && !validThreadID(token) {
+		return "", "", start, false, false
 	}
-	if strings.HasPrefix(remainder, "…") {
-		remainder = strings.TrimSpace(strings.TrimPrefix(remainder, "…"))
+	return token, compact, index, ellipsis, true
+}
+
+func canonicalPrefix(compact string) string {
+	var result strings.Builder
+	for index, value := range compact {
+		if index == 8 || index == 12 || index == 16 || index == 20 {
+			result.WriteByte('-')
+		}
+		result.WriteRune(value)
 	}
-	remainder = strings.TrimSpace(remainder)
-	if strings.HasPrefix(remainder, "|") {
-		remainder = strings.TrimSpace(remainder[1:])
+	return result.String()
+}
+
+func titleTokenStartBoundary(value string, index int) bool {
+	if index == 0 {
+		return true
 	}
-	parts := strings.SplitN(remainder, "|", 2)
-	if len(parts) > 0 {
-		threadTitle = strings.TrimSpace(parts[0])
+	if index < 0 || index > len(value) {
+		return false
 	}
-	if len(parts) == 2 {
-		projectName = strings.TrimSpace(parts[1])
+	previous, _ := utf8.DecodeLastRuneInString(value[:index])
+	return identityBoundaryRune(previous)
+}
+
+func titleTokenEndBoundary(value string, index int) bool {
+	if index == len(value) {
+		return true
 	}
-	return prefix, threadTitle, projectName, true
+	if index < 0 || index > len(value) {
+		return false
+	}
+	next, _ := utf8.DecodeRuneInString(value[index:])
+	return identityBoundaryRune(next)
+}
+
+func identityBoundaryRune(value rune) bool {
+	if unicode.IsLetter(value) || unicode.IsNumber(value) || value == '_' || value == '-' {
+		return false
+	}
+	if strings.ContainsRune(`/\\?#=&`, value) {
+		return false
+	}
+	return unicode.IsSpace(value) || unicode.IsPunct(value) || unicode.IsSymbol(value)
+}
+
+func inSpan(index int, spans [][]int) bool {
+	for _, span := range spans {
+		if index >= span[0] && index < span[1] {
+			return true
+		}
+	}
+	return false
+}
+
+func isHex(value byte) bool {
+	return value >= '0' && value <= '9' || value >= 'a' && value <= 'f' || value >= 'A' && value <= 'F'
+}
+
+func hasPotentialUUID(title string) bool {
+	return identityStartPattern.MatchString(title)
 }
 
 func (r DiscoveryResult) WriteJSON(output io.Writer) error {

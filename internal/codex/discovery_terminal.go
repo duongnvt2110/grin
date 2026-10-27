@@ -14,7 +14,7 @@ import (
 	"strings"
 )
 
-func readTerminalTitles(ctx context.Context, goos string) ([]TerminalObservation, []string, bool, string, error) {
+func readTerminalTitles(ctx context.Context, goos string) ([]TerminalObservation, []string, bool, bool, string, error) {
 	if goos == "darwin" {
 		return readDarwinTerminalTitles(ctx)
 	}
@@ -23,29 +23,34 @@ func readTerminalTitles(ctx context.Context, goos string) ([]TerminalObservation
 	return readTerminalScript(runCtx, goos)
 }
 
-func readDarwinTerminalTitles(ctx context.Context) ([]TerminalObservation, []string, bool, string, error) {
+func readDarwinTerminalTitles(ctx context.Context) ([]TerminalObservation, []string, bool, bool, string, error) {
 	runCtx, cancel := context.WithTimeout(ctx, darwinReadTimeout)
 	defer cancel()
 	titleCtx, cancelTitle := context.WithTimeout(runCtx, darwinTitleTimeout)
-	observations, sources, supported, reason, titleErr := readTerminalScript(titleCtx, "darwin")
+	observations, sources, nativeSupported, nativeComplete, reason, titleErr := readTerminalScript(titleCtx, "darwin")
 	cancelTitle()
-	tmuxObservations, tmuxSupported, tmuxErr := readScopedTmuxTitles(runCtx)
-	if tmuxErr != nil && !supported {
-		return nil, sources, false, "scoped tmux title probe timed out", tmuxErr
-	}
-	if tmuxSupported {
-		observations = append(observations, tmuxObservations...)
+	tmuxObservations, tmuxApplicable, tmuxComplete, tmuxErr := readScopedTmuxTitles(runCtx)
+	nativeApplicable := titleErr != nil || len(sources) > 0
+	if tmuxApplicable {
 		sources = append(sources, "tmux-current-session")
-		supported = true
-		reason = ""
 	}
-	if titleErr != nil && !supported {
-		return nil, sources, false, "native terminal title API could not be read and scoped tmux was unavailable", titleErr
+	if tmuxErr == nil && tmuxApplicable {
+		observations = append(observations, tmuxObservations...)
 	}
-	return observations, sources, supported, reason, nil
+	supported := nativeSupported || tmuxErr == nil && tmuxApplicable
+	complete := (nativeApplicable && nativeSupported && nativeComplete || !nativeApplicable) &&
+		(tmuxApplicable && tmuxErr == nil && tmuxComplete || !tmuxApplicable) &&
+		(nativeApplicable || tmuxApplicable)
+	if tmuxErr != nil && reason == "" {
+		reason = "scoped tmux title probe failed"
+	}
+	if titleErr != nil && reason == "" {
+		reason = "native terminal title API could not be read"
+	}
+	return observations, sources, supported, complete, reason, nil
 }
 
-func readTerminalScript(ctx context.Context, goos string) ([]TerminalObservation, []string, bool, string, error) {
+func readTerminalScript(ctx context.Context, goos string) ([]TerminalObservation, []string, bool, bool, string, error) {
 	var name, input string
 	switch goos {
 	case "darwin":
@@ -55,14 +60,14 @@ func readTerminalScript(ctx context.Context, goos string) ([]TerminalObservation
 	case "windows":
 		name, input = "windows.ps1", "powershell.exe"
 	default:
-		return nil, nil, false, "terminal title discovery is unsupported on this OS", nil
+		return nil, nil, false, false, "terminal title discovery is unsupported on this OS", nil
 	}
 	if _, err := exec.LookPath(input); err != nil {
-		return nil, nil, false, "native terminal title command is unavailable", nil
+		return nil, nil, false, false, "native terminal title command is unavailable", nil
 	}
 	script, err := terminalDiscoveryScripts.ReadFile("terminal_discovery/" + name)
 	if err != nil {
-		return nil, nil, false, "bundled terminal title script is unavailable", err
+		return nil, nil, false, false, "bundled terminal title script is unavailable", err
 	}
 	var command *exec.Cmd
 	switch goos {
@@ -79,80 +84,90 @@ func readTerminalScript(ctx context.Context, goos string) ([]TerminalObservation
 	command.Cancel = func() error { return killDiscoveryProcess(command) }
 	stdout, err := command.StdoutPipe()
 	if err != nil {
-		return nil, nil, false, "native terminal title API could not be read", err
+		return nil, nil, false, false, "native terminal title API could not be read", err
 	}
 	if err := command.Start(); err != nil {
-		return nil, nil, false, "native terminal title API is unavailable", nil
+		return nil, nil, false, false, "native terminal title API is unavailable", nil
 	}
 	output, readErr := io.ReadAll(io.LimitReader(stdout, maxDiscoveryOutput+1))
 	if len(output) > maxDiscoveryOutput {
 		_ = killDiscoveryProcess(command)
 		_ = command.Wait()
-		return nil, nil, false, "native terminal title output exceeded its limit", nil
+		return nil, nil, false, false, "native terminal title output exceeded its limit", nil
 	}
 	waitErr := command.Wait()
 	if readErr != nil {
-		return nil, nil, false, "native terminal title output could not be read", readErr
+		return nil, nil, false, false, "native terminal title output could not be read", readErr
 	}
 	if waitErr != nil {
 		if ctx.Err() != nil {
-			return nil, nil, false, "native terminal title probe timed out", context.DeadlineExceeded
+			return nil, nil, false, false, "native terminal title probe timed out", context.DeadlineExceeded
 		}
-		return nil, nil, false, "native terminal title API is unavailable", nil
+		return nil, nil, false, false, "native terminal title probe failed", waitErr
 	}
 	return parseTerminalOutput(goos, output)
 }
 
-func readScopedTmuxTitles(ctx context.Context) ([]TerminalObservation, bool, error) {
+func readScopedTmuxTitles(ctx context.Context) ([]TerminalObservation, bool, bool, error) {
 	tmuxEnv, paneEnv := os.Getenv("TMUX"), os.Getenv("TMUX_PANE")
 	socket, pane, ok := scopedTmuxTarget(tmuxEnv, paneEnv)
 	if !ok {
-		return nil, false, nil
+		return nil, false, true, nil
 	}
 	tmux, err := exec.LookPath("tmux")
 	if err != nil {
-		return nil, false, nil
+		return nil, true, false, err
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, tmuxProbeTimeout)
 	defer cancel()
 	sessionOutput, err := runBoundedDiscoveryCommand(probeCtx, tmux, "-S", socket, "display-message", "-p", "-t", pane, "#{session_id}")
 	if err != nil {
 		if probeCtx.Err() != nil {
-			return nil, false, context.DeadlineExceeded
+			return nil, true, false, context.DeadlineExceeded
 		}
-		return nil, false, nil
+		return nil, true, false, err
 	}
 	session := strings.TrimSpace(string(sessionOutput))
 	if len(session) < 2 || session[0] != '$' || strings.Trim(session[1:], "0123456789") != "" {
-		return nil, false, nil
+		return nil, true, false, errors.New("tmux returned an invalid session identifier")
 	}
 	format := "#{pane_id}\037#{pane_title}\037#{pane_current_path}\037#{pane_active}"
 	output, err := runBoundedDiscoveryCommand(probeCtx, tmux, "-S", socket, "list-panes", "-s", "-t", session, "-F", format)
 	if err != nil {
 		if probeCtx.Err() != nil {
-			return nil, false, context.DeadlineExceeded
+			return nil, true, false, context.DeadlineExceeded
 		}
-		return nil, false, nil
+		return nil, true, false, err
 	}
 	observations := make([]TerminalObservation, 0)
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		fields := strings.SplitN(line, "\x1f", 4)
-		if len(fields) != 4 || !validTmuxPaneID(fields[0]) {
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	complete := len(lines) <= maxDiscoverySurfaces
+	if len(lines) > maxDiscoverySurfaces {
+		lines = lines[:maxDiscoverySurfaces]
+	}
+	for _, line := range lines {
+		if line == "" {
 			continue
 		}
-		if _, _, _, validTitle := parseThreadTitle(fields[1]); !validTitle {
+		fields := strings.SplitN(line, "\x1f", 4)
+		if len(fields) != 4 || !validTmuxPaneID(fields[0]) {
+			complete = false
 			continue
+		}
+		if !hasPotentialUUID(fields[1]) {
+			continue
+		}
+		if len(observations) == maxTerminalWindows {
+			complete = false
+			break
 		}
 		focused := fields[0] == pane && fields[3] == "1"
 		observations = append(observations, TerminalObservation{
 			API: "tmux", ID: session + ":" + fields[0], Title: fields[1], Workspace: fields[2],
 			Foreground: focused, Focused: focused,
 		})
-		if len(observations) == maxTerminalWindows {
-			break
-		}
 	}
-	return observations, true, nil
+	return observations, true, complete, nil
 }
 
 func scopedTmuxTarget(tmuxEnv, paneEnv string) (socket, pane string, ok bool) {
@@ -203,26 +218,30 @@ func runBoundedDiscoveryCommand(ctx context.Context, executable string, args ...
 	return output, nil
 }
 
-func parseTerminalOutput(goos string, output []byte) ([]TerminalObservation, []string, bool, string, error) {
+func parseTerminalOutput(goos string, output []byte) ([]TerminalObservation, []string, bool, bool, string, error) {
 	if goos == "linux" {
 		return parseLinuxTerminalOutput(string(output))
 	}
 	var snapshot terminalSnapshot
 	if err := json.Unmarshal(output, &snapshot); err != nil {
-		return nil, nil, false, "native terminal title output was malformed", err
+		return nil, nil, false, false, "native terminal title output was malformed", err
 	}
 	if !snapshot.Supported {
-		return nil, snapshot.Sources, false, snapshot.Reason, nil
+		return snapshot.Terminals, snapshot.Sources, false, false, snapshot.Reason, nil
 	}
 	if len(snapshot.Terminals) > maxTerminalWindows {
 		snapshot.Terminals = snapshot.Terminals[:maxTerminalWindows]
+		snapshot.Complete = false
 	}
-	return snapshot.Terminals, snapshot.Sources, true, "", nil
+	return snapshot.Terminals, snapshot.Sources, true, snapshot.Complete, snapshot.Reason, nil
 }
 
-func parseLinuxTerminalOutput(output string) ([]TerminalObservation, []string, bool, string, error) {
+func parseLinuxTerminalOutput(output string) ([]TerminalObservation, []string, bool, bool, string, error) {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	supported := false
+	complete := false
+	completeSeen := false
+	malformedX11 := false
 	reason := "Linux terminal title APIs are unavailable"
 	sources := []string{}
 	terminals := make([]TerminalObservation, 0, len(lines))
@@ -242,12 +261,16 @@ func parseLinuxTerminalOutput(output string) ([]TerminalObservation, []string, b
 			continue
 		case line == "SOURCES":
 			continue
+		case strings.HasPrefix(line, "COMPLETE\t"):
+			completeSeen = true
+			complete = strings.TrimPrefix(line, "COMPLETE\t") == "true"
+			continue
 		case line == "":
 			continue
 		}
 		fields := strings.SplitN(line, "\t", 6)
 		if len(fields) != 6 {
-			return nil, sources, false, "Linux terminal title API returned malformed data", fmt.Errorf("invalid Linux terminal record")
+			return nil, sources, false, false, "Linux terminal title API returned malformed data", fmt.Errorf("invalid Linux terminal record")
 		}
 		title := fields[5]
 		if fields[0] == "x11-ewmh" {
@@ -257,6 +280,7 @@ func parseLinuxTerminalOutput(output string) ([]TerminalObservation, []string, b
 			var err error
 			title, err = strconv.Unquote(title)
 			if err != nil {
+				malformedX11 = true
 				continue
 			}
 		}
@@ -273,10 +297,13 @@ func parseLinuxTerminalOutput(output string) ([]TerminalObservation, []string, b
 		}
 	}
 	if !supported {
-		if len(lines) == 0 || !strings.HasPrefix(lines[len(lines)-1], "UNSUPPORTED\t") {
-			return nil, sources, false, "Linux terminal title API returned an unsupported response", fmt.Errorf("invalid Linux terminal response")
+		if reason == "Linux terminal title APIs are unavailable" {
+			return nil, sources, false, false, "Linux terminal title API returned an unsupported response", fmt.Errorf("invalid Linux terminal response")
 		}
-		return nil, sources, false, reason, nil
+		return terminals, sources, false, false, reason, nil
 	}
-	return terminals, sources, true, "", nil
+	// The script's COMPLETE marker can follow malformed records. Never let
+	// that marker authorize a scan which discarded unreadable X11 titles.
+	complete = completeSeen && complete && !malformedX11
+	return terminals, sources, true, complete, "", nil
 }

@@ -29,21 +29,29 @@ var nextToolCallID uint64
 
 const serverInstructions = `Grin provides local workspace capabilities subject to the active policy.
 
-In normal mode, workspace.list is global. Every filesystem, Git, shell, and
-workspace.info request must include an absolute workspace path. Grin selects
-only an exact registered workspace; it never guesses, falls back, or changes
-workspace state from conversation context. First determine the target project
-from the task and conversation. Use its exact known workspace path directly,
-including when the project is identified by name. workspace.list discovers
-registered workspaces; it does not select the target for a task. When the exact
-path is unknown, use workspace.list only to find candidates matching the task.
-Never choose a workspace just because it is the only or first result. If no
-candidate matches clearly, ask the user which workspace to use. Reuse the
-established workspace only while the task remains in that project.
-YOLO mode keeps the single startup workspace behavior for filesystem, Git, and
-shell tools. Codex tools always require an explicit workspace: Normal mode
-requires a registered workspace, while YOLO may target any existing absolute
+workspace.list is global in both modes and returns registered workspaces.
+Filesystem, Git, shell, and workspace.info tools accept an optional workspace
+argument. Normal mode requires an exact registered workspace path. YOLO uses
+the startup workspace when the argument is omitted and accepts any existing
+canonical absolute directory when it is supplied. workspace.list discovers
+registered workspaces; explicit YOLO targets use startup limits and shell
+settings without loading the target's .grin/config.yaml. It does not select
+the target for a task. First
+determine the target project from the task and conversation. Use its exact
+known workspace path directly, including when the project is identified by
+name. When the path is unknown, use workspace.list only to find candidates
+matching the task. Never choose a workspace just because it is the only or
+first result. If no candidate matches clearly, ask the user which workspace to
+use. Reuse the established workspace only while the task remains in that
+project. Codex tools always require an explicit workspace: Normal mode requires
+a registered workspace, while YOLO may target any existing canonical absolute
 workspace.
+
+Lookup-only requests to find, list, or inspect Codex thread IDs are read-only:
+when shell.run is available and authorized, run
+grin codex discover --workspace <exact-workspace>.
+Never call codex.queue solely for lookup. Use codex.queue only for a
+user-requested Codex send or review; it performs fresh discovery before sending.
 
 For Codex requests, codex.queue performs fresh, read-only discovery inside
 Grin on every send, including sends with a supplied thread_id. Do not reuse a
@@ -62,9 +70,13 @@ title, shortened ID, and terminal identity) and ask the user which one to select
 call codex.queue again with the selected full UUID. If none is eligible or
 discovery is unavailable or identity is ambiguous, stop without sending. Never
 select by result order, recency, window foreground, or terminal focus.
-Supply thread_id only when the user explicitly names/selects it for this task
-or as a follow-up in the same uninterrupted review loop. Even supplied UUIDs
-must still match a fresh eligible discovery result before queueing.
+On a new task, use thread_id only when the user explicitly names/selects it for
+that task. Reuse that UUID without another prompt only for follow-ups in the
+same user-authorized, uninterrupted review loop for that task. Conversation
+history alone never carries a recipient into another task; if the task changes
+or the loop ends/is interrupted, omit thread_id and obtain fresh candidates.
+Every queue request performs fresh discovery; supplied IDs must match a fresh
+eligible candidate.
 
 Title-derived candidates remain UNRESOLVED because native APIs do not prove
 freshness across /new, /clear, or /resume. A user's explicit candidate choice
@@ -75,13 +87,10 @@ Selection alone does not authorize sending a message or implementing code. If
 the user already asked to send a report and is now selecting its recipient,
 the earlier send authorization remains applicable; no duplicate authorization
 is needed.
-Reuse the exact selected UUID for follow-ups in the same uninterrupted
-review loop, without asking again, but let Grin validate it against fresh
-discovery on every queue request. Keep each request_id paired with the returned
-thread_id for codex.turn_result. Never reuse a recipient from an earlier
-standalone task. The server enforces technical eligibility and a fresh
-candidate match; the MCP client remains responsible for respecting the
-human's explicit choice when multiple recipients exist.
+Keep each request_id paired with the returned thread_id for codex.turn_result.
+The server enforces technical eligibility against a fresh candidate match; the
+MCP client remains responsible for respecting the human's explicit choice when
+multiple recipients exist.
 
 Codex review supports three behaviors:
 
@@ -171,6 +180,9 @@ type codexRecipientOption struct {
 // or a previous request's thread ID. The caller performs discovery on every
 // queue call, including when the user supplied a thread ID explicitly.
 func selectFreshCodexRecipient(fresh codex.DiscoveryResult, requested string) (string, []codexRecipientOption, error) {
+	if !fresh.Complete {
+		return "", nil, errs.New(errs.ErrUnsupported, "fresh Codex discovery was incomplete; no message queued", false)
+	}
 	options := make([]codexRecipientOption, 0, len(fresh.Candidates))
 	seen := make(map[string]bool)
 	unverified := make([]codex.ThreadCandidate, 0)
@@ -296,7 +308,7 @@ func authorize(ctx context.Context, deps Dependencies, toolCallID string, operat
 		decision = deps.Policy.Evaluate(ctx, operation)
 	}
 	workspace := ""
-	if isCodexTool(operation.Tool) || (!deps.Config.Yolo && isWorkspaceScopedTool(operation.Tool)) {
+	if isWorkspaceScopedTool(operation.Tool) {
 		workspace = deps.Config.Workspace.Root
 	}
 	publish(deps.Events, events.Event{ToolCallID: toolCallID, Workspace: workspace, Type: events.EventPolicyDecision, Tool: operation.Tool, Summary: decision.Reason, Status: events.StatusRunning, Time: time.Now()})
@@ -340,8 +352,10 @@ func isCodexTool(name string) bool {
 type rawToolHandler func(context.Context, Dependencies, string, json.RawMessage) (any, error)
 
 func addTool(server *sdk.Server, base Dependencies, workspaceScoped bool, name, description string, inputSchema any, handler rawToolHandler) {
-	if isCodexTool(name) || (workspaceScoped && !base.Config.Yolo) {
-		inputSchema = workspaceSchema(inputSchema)
+	if isCodexTool(name) {
+		inputSchema = workspaceSchema(inputSchema, true)
+	} else if workspaceScoped {
+		inputSchema = workspaceSchema(inputSchema, false)
 	}
 	server.AddTool(&sdk.Tool{Name: name, Description: description, InputSchema: inputSchema}, func(ctx context.Context, request *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
 		toolCallID := fmt.Sprintf("tool-%d", atomic.AddUint64(&nextToolCallID, 1))
@@ -357,9 +371,9 @@ func addTool(server *sdk.Server, base Dependencies, workspaceScoped bool, name, 
 			}
 		} else if workspaceScoped && base.Config.Yolo {
 			var err error
-			raw, err = normalizeYOLOWorkspace(raw, base.Filesystem.Root())
+			workspace, raw, deps, err = selectYOLOWorkspace(base, raw)
 			if err != nil {
-				publish(base.Events, events.Event{ToolCallID: toolCallID, Type: events.EventToolFailed, Tool: name, Summary: "workspace compatibility failed", Status: events.StatusFailed, Time: time.Now()})
+				publish(base.Events, events.Event{ToolCallID: toolCallID, Type: events.EventToolFailed, Tool: name, Summary: "workspace selection failed", Status: events.StatusFailed, Time: time.Now()})
 				return toolError(err), nil
 			}
 		}

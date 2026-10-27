@@ -51,7 +51,7 @@ func TestTitleUUIDDiscoveryWithoutSQLiteRecord(t *testing.T) {
 				serveDiscoveryThread(t, home, test.thread, test.failRead)
 			}
 			service := &Service{home: func() (string, error) { return home, nil }, sqlite: func(context.Context, string, string) ([]byte, error) { return nil, errors.New("no persisted state") }}
-			result, err := service.discoverFromTitles(context.Background(), canonical, []TerminalObservation{{Title: discoveryThreadA[:28] + "... | " + strings.ToUpper(discoveryThreadA) + " | grin"}})
+			result, err := service.discoverFromTitles(context.Background(), canonical, []TerminalObservation{{Title: discoveryThreadA[:28] + "... | " + strings.ToUpper(discoveryThreadA) + " | grin"}}, true)
 			if err != nil || len(result.Candidates) != 1 {
 				t.Fatalf("discovery = %#v, err %v", result, err)
 			}
@@ -94,7 +94,7 @@ func TestTitleUUIDDiscoveryHonorsKnownArchivedState(t *testing.T) {
 			service := &Service{home: func() (string, error) { return home, nil }, sqlite: sqlite}
 			result, err := service.discoverFromTitles(context.Background(), canonical, []TerminalObservation{{
 				Title: discoveryThreadA[:28] + "... | " + strings.ToUpper(discoveryThreadA) + " | grin",
-			}})
+			}}, true)
 			if err != nil || len(result.Candidates) != 1 {
 				t.Fatalf("discovery = %#v, err %v", result, err)
 			}
@@ -121,13 +121,12 @@ func TestConflictingTitleUUIDDoesNotFallBackToOlderPrefix(t *testing.T) {
 	service := &Service{home: func() (string, error) { return home, nil }, sqlite: sqlite}
 	result, err := service.discoverFromTitles(context.Background(), canonical, []TerminalObservation{{
 		Title: prefix + "... | 01a142bf-dea7-7a43-a6b1-83ea32c95866 | grin",
-	}})
-	if err != nil || len(result.Candidates) != 1 {
+	}}, true)
+	if err != nil || len(result.Candidates) != 0 {
 		t.Fatalf("discovery = %#v, err %v", result, err)
 	}
-	candidate := result.Candidates[0]
-	if candidate.ThreadID != "" || candidate.Resolution != "title_uuid_mismatch" {
-		t.Fatalf("conflicting title candidate = %#v", candidate)
+	if !strings.Contains(strings.Join(result.Evidence, " "), "conflicting") {
+		t.Fatalf("conflicting title identity was not reported: %#v", result)
 	}
 	for _, query := range *queries {
 		if query == threadPrefixQuery(prefix) {
@@ -151,7 +150,7 @@ func TestDescriptiveTitleStillUsesSQLitePrefixFallback(t *testing.T) {
 	service := &Service{home: func() (string, error) { return home, nil }, sqlite: sqlite}
 	result, err := service.discoverFromTitles(context.Background(), canonical, []TerminalObservation{{
 		Title: prefix + "... | A descriptive thread title | grin",
-	}})
+	}}, true)
 	if err != nil || len(result.Candidates) != 1 {
 		t.Fatalf("discovery = %#v, err %v", result, err)
 	}

@@ -25,10 +25,8 @@ func registerFilesystemTools(server *sdk.Server, deps Dependencies) {
 		if err != nil {
 			return nil, err
 		}
-		if outside {
-			if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.list", Capability: "filesystem.read", Arguments: input, Outside: true}, "list "+displayPath(input.Path), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
-				return nil, err
-			}
+		if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.list", Capability: "filesystem.read", Arguments: input, Outside: outside}, "list "+displayPath(input.Path), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
+			return nil, err
 		}
 		output, err := deps.Filesystem.List(ctx, input, outside)
 		if err != nil {
@@ -47,10 +45,8 @@ func registerFilesystemTools(server *sdk.Server, deps Dependencies) {
 		if err != nil {
 			return nil, err
 		}
-		if outside {
-			if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.stat", Capability: "filesystem.read", Arguments: input, Outside: true}, "stat "+displayPath(input.Path), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
-				return nil, err
-			}
+		if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.stat", Capability: "filesystem.read", Arguments: input, Outside: outside}, "stat "+displayPath(input.Path), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
+			return nil, err
 		}
 		output, err := deps.Filesystem.Stat(ctx, input, outside)
 		if err != nil {
@@ -70,10 +66,8 @@ func registerFilesystemTools(server *sdk.Server, deps Dependencies) {
 		if err != nil {
 			return nil, err
 		}
-		if outside {
-			if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.read_text", Capability: "filesystem.read", Arguments: input, Outside: true}, "read "+displayPath(input.Path), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
-				return nil, err
-			}
+		if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.read_text", Capability: "filesystem.read", Arguments: input, Outside: outside}, "read "+displayPath(input.Path), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
+			return nil, err
 		}
 		output, err := deps.Filesystem.ReadText(ctx, input, outside)
 		if err != nil {
@@ -94,10 +88,8 @@ func registerFilesystemTools(server *sdk.Server, deps Dependencies) {
 		if err != nil {
 			return nil, err
 		}
-		if outside {
-			if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.search", Capability: "filesystem.read", Arguments: input, Outside: true}, "search "+displayText(input.Query), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
-				return nil, err
-			}
+		if err := authorize(ctx, deps, toolCallID, policy.Operation{Tool: "fs.search", Capability: "filesystem.read", Arguments: input, Outside: outside}, "search "+displayText(input.Query), "path: "+displayPath(input.Path), approval.RiskLow); err != nil {
+			return nil, err
 		}
 		output, err := deps.Filesystem.Search(ctx, input, outside)
 		return toolResult{Value: output, Summary: searchSummary(input.Query, input.Path)}, err

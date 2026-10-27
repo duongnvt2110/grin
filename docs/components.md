@@ -54,8 +54,8 @@ catalog and selects the workspace on each normal-mode scoped request.
 | OpenAI Secure MCP Tunnel | Carries requests to the local machine without requiring a public Grin endpoint. |
 | `tunnel-client` | Runs locally and forwards tunnel traffic to Grin's loopback MCP endpoint. |
 | MCP server | Registers tools once, validates tool inputs, resolves workspace-scoped requests, and returns bounded results. |
-| Workspace registry | `~/.grin/config.yaml`; lists exact canonical workspaces allowed for normal-mode routing. |
-| Workspace config | `<workspace>/.grin/config.yaml`; selected requests use limits/shell settings, while the startup workspace supplies process server/TUI defaults. Normal policy is built in; YOLO is selected only by the startup CLI. |
+| Workspace registry | `~/.grin/config.yaml`; lists registered canonical workspaces for discovery and Normal-mode routing. |
+| Workspace config | `<workspace>/.grin/config.yaml`; Normal selected requests use target limits/shell settings. YOLO uses startup limits/shell settings even for explicit targets; startup config also supplies server/TUI defaults. Normal policy is built in; YOLO is selected only by the startup CLI. |
 | Policy | Decides whether a supported operation is allowed, requires approval, or is denied. |
 | Approval manager | Coordinates local operator approval before an operation that requires it executes. |
 | Filesystem service | Performs bounded list/stat/read/search/write/edit behavior rooted at one workspace. |
@@ -107,7 +107,7 @@ registry directly.
 ### Workspace-scoped tools
 
 ```text
-request(workspace=/projects/api, ...)
+Normal-mode request(workspace=/projects/api, ...)
   ↓
 require non-empty absolute workspace
   ↓
@@ -134,7 +134,9 @@ execute against /projects/api only
 result + workspace-aware lifecycle events
 ```
 
-There is no fallback to the startup workspace or another registered workspace.
+Normal mode never falls back to the startup workspace or another registered
+workspace. In YOLO, omission uses the configured startup workspace; an invalid
+explicit path is rejected without fallback.
 
 ## Multiple conversations
 
@@ -151,25 +153,32 @@ never mutated globally.
 
 ## YOLO flow
 
-Filesystem, Git, and shell tools in YOLO deliberately keep the single startup
-workspace. Codex review tools instead require an explicit existing target
-workspace and do not apply that startup-root restriction:
+Filesystem, Git, and shell tools in YOLO use the startup workspace when no
+workspace is supplied. An explicit canonical existing directory is routed
+through request-local filesystem/runtime/Git dependencies; it need not be
+registered. These requests keep startup limits and shell settings. Codex review
+tools continue to require an explicit existing target workspace:
 
 ```text
 grin --workspace /repo/a --yolo
         ↓
-filesystem / Git / shell tools use one startup workspace
+filesystem / Git / shell tools use startup workspace when omitted
         ↓
-workspace.list returns the startup workspace for compatibility
-no selector or registry routing for filesystem / Git / shell tools
+workspace.list returns registered workspaces
+explicit scoped target builds request-local dependencies
         ↓
-relative paths/default cwd/Git use /repo/a as their base
+relative paths/default cwd/Git use the selected root as their base
         ↓
 workspace containment and Grin approval restrictions are bypassed
 ```
 
-Codex tools remain explicitly workspace-scoped in YOLO mode and can target an
-existing directory outside the startup workspace.
+YOLO explicit targets use startup limits and shell settings without loading
+the target's `.grin/config.yaml`. Invalid explicit paths fail before execution
+and never fall back to the startup root.
+
+The first upgrade to unified tool schemas requires a one-time ChatGPT
+connector catalog refresh. Later mode switches use the same catalog; transport
+reconnection after a restart is separate.
 
 OS permissions, input validation, limits, timeout/cancellation, cleanup, and
 runtime correctness checks still apply.

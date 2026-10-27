@@ -6,6 +6,7 @@ import (
 )
 
 var assignmentPattern = regexp.MustCompile(`^(\s*(?:export\s+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?\s*)([:=])(\s*)(.*)$`)
+var inlineAssignmentPattern = regexp.MustCompile(`(^|[^A-Za-z0-9_"'])([A-Za-z_][A-Za-z0-9_.-]*)(\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^|,;\r\n]*)`)
 var jsonSensitiveFieldPattern = regexp.MustCompile(`(?i)(["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?\s*:\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')`)
 var urlCredentialPattern = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)([A-Za-z0-9._~%+-]+):([A-Za-z0-9._~%:+-]+)@([A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]+\])`)
 var privateKeyMarkerPattern = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----`)
@@ -54,6 +55,7 @@ func SanitizeText(content string) string {
 			}
 		}
 		if !replacedAssignment {
+			body = redactInlineAssignments(body)
 			body = redactJSONFields(body)
 			body = urlCredentialPattern.ReplaceAllString(body, `${1}<redacted>@${4}`)
 		}
@@ -61,6 +63,21 @@ func SanitizeText(content string) string {
 		result.WriteString(terminator)
 	}
 	return result.String()
+}
+
+func redactInlineAssignments(value string) string {
+	indices := inlineAssignmentPattern.FindAllStringSubmatchIndex(value, -1)
+	for index := len(indices) - 1; index >= 0; index-- {
+		match := indices[index]
+		raw := value[match[8]:match[9]]
+		if !sensitiveName(value[match[4]:match[5]]) ||
+			(strings.HasSuffix(strings.TrimSpace(value[match[6]:match[7]]), ":") && strings.HasPrefix(strings.TrimSpace(raw), "=")) {
+			continue
+		}
+		trimmed := strings.TrimRight(raw, " \t")
+		value = value[:match[8]] + redactValue(trimmed) + raw[len(trimmed):] + value[match[9]:]
+	}
+	return value
 }
 
 func redactJSONFields(value string) string {

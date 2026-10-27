@@ -35,6 +35,11 @@ func TestRedactSensitiveContent(t *testing.T) {
 		want  string
 	}{
 		{name: "password", input: "PASSWORD=secret", want: "PASSWORD=<redacted>"},
+		{name: "inline token", input: "Review token=secret | title", want: "Review token=<redacted> | title"},
+		{name: "inline token spacing", input: "Review token= secret | title", want: "Review token= <redacted> | title"},
+		{name: "inline quoted token", input: `Review token="secret" | title`, want: `Review token="<redacted>" | title`},
+		{name: "inline spaced quoted token", input: `Review token= "secret" | title`, want: `Review token= "<redacted>" | title`},
+		{name: "inline non-sensitive key", input: "Review ticket=note | title", want: "Review ticket=note | title"},
 		{name: "export password", input: "export PASSWORD=secret", want: "export PASSWORD=<redacted>"},
 		{name: "inline json fields", input: `{"host":"localhost","password":"secret","api_key":"secret"}`, want: `{"host":"localhost","password":"<redacted>","api_key":"<redacted>"}`},
 		{name: "spacing", input: "PASSWORD = secret", want: "PASSWORD = <redacted>"},

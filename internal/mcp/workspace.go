@@ -15,7 +15,7 @@ import (
 )
 
 func selectCodexWorkspace(base Dependencies, raw json.RawMessage) (string, json.RawMessage, Dependencies, error) {
-	workspace, inner, err := splitWorkspace(raw)
+	workspace, inner, err := splitWorkspace(raw, true)
 	if err != nil {
 		return "", nil, base, err
 	}
@@ -81,42 +81,52 @@ func resolveRegisteredWorkspace(requested string, serverConfig config.Config) (c
 	return selected, canonical, nil
 }
 
-func normalizeYOLOWorkspace(raw json.RawMessage, root string) (json.RawMessage, error) {
-	var fields map[string]json.RawMessage
-	if err := decode(raw, &fields); err != nil {
-		return nil, errs.New(errs.ErrInvalidInput, "invalid tool arguments", false)
-	}
-
-	value, ok := fields["workspace"]
-	if !ok {
-		return raw, nil
-	}
-
-	var workspace string
-	if err := json.Unmarshal(value, &workspace); err != nil || strings.TrimSpace(workspace) == "" {
-		return nil, errs.New(errs.ErrInvalidInput, "workspace must be a non-empty string", false)
-	}
-	if !filepath.IsAbs(workspace) || filepath.Clean(workspace) != filepath.Clean(root) {
-		return nil, errs.New(errs.ErrInvalidInput, "workspace does not match the YOLO startup workspace", false)
-	}
-
-	copied := make(map[string]json.RawMessage, len(fields)-1)
-	for key, field := range fields {
-		if key != "workspace" {
-			copied[key] = field
-		}
-	}
-	normalized, err := json.Marshal(copied)
+func selectYOLOWorkspace(base Dependencies, raw json.RawMessage) (string, json.RawMessage, Dependencies, error) {
+	workspace, inner, err := splitWorkspace(raw, false)
 	if err != nil {
-		return nil, errs.New(errs.ErrInvalidInput, "invalid tool arguments", false)
+		return "", nil, base, err
 	}
-	return normalized, nil
+	if workspace == "" {
+		root := base.Filesystem.Root()
+		base.Config.Workspace.Root = root
+		return root, inner, base, nil
+	}
+	if !filepath.IsAbs(workspace) {
+		return "", nil, base, errs.New(errs.ErrInvalidInput, "workspace must be an absolute path", false)
+	}
+	requested := filepath.Clean(workspace)
+	canonical, err := filepath.EvalSymlinks(requested)
+	if err != nil || filepath.Clean(canonical) != requested {
+		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace is unavailable", true)
+	}
+	info, err := os.Stat(canonical)
+	if err != nil || !info.IsDir() {
+		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace is unavailable", true)
+	}
+
+	selected := base.Config
+	selected.Yolo = true
+	selected.Workspace.Root = canonical
+	files, err := filesystem.New(canonical, selected.Limits, true)
+	if err != nil {
+		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace filesystem is unavailable", true)
+	}
+	runtimeService, err := grinruntime.New(selected, files.Root())
+	if err != nil {
+		return "", nil, base, errs.New(errs.ErrWorkspaceUnavailable, "workspace runtime is unavailable", true)
+	}
+	selected.Workspace.Root = files.Root()
+	base.Config = selected
+	base.Filesystem = files
+	base.Runtime = runtimeService
+	base.Git = gringit.New(runtimeService, files.Root())
+	return files.Root(), inner, base, nil
 }
 
-func workspaceSchema(schema any) map[string]any {
+func workspaceSchema(schema any, requiredWorkspace bool) map[string]any {
 	result, ok := schema.(map[string]any)
 	if !ok {
-		return map[string]any{"type": "object", "properties": map[string]any{"workspace": map[string]any{"type": "string"}}, "required": []string{"workspace"}, "additionalProperties": false}
+		result = map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}
 	}
 	copy := make(map[string]any, len(result)+1)
 	for key, value := range result {
@@ -129,7 +139,21 @@ func workspaceSchema(schema any) map[string]any {
 		}
 	}
 	copy["properties"] = properties
-	copy["required"] = append([]string{"workspace"}, stringSlice(copy["required"])...)
+	required := stringSlice(copy["required"])
+	filtered := make([]string, 0, len(required)+1)
+	for _, field := range required {
+		if field != "workspace" {
+			filtered = append(filtered, field)
+		}
+	}
+	if requiredWorkspace {
+		filtered = append([]string{"workspace"}, filtered...)
+	}
+	if len(filtered) == 0 {
+		delete(copy, "required")
+	} else {
+		copy["required"] = filtered
+	}
 	copy["additionalProperties"] = false
 	return copy
 }
@@ -140,7 +164,7 @@ func stringSlice(value any) []string {
 }
 
 func selectWorkspace(base Dependencies, raw json.RawMessage) (string, json.RawMessage, Dependencies, error) {
-	workspace, inner, err := splitWorkspace(raw)
+	workspace, inner, err := splitWorkspace(raw, true)
 	if err != nil {
 		return "", nil, base, err
 	}
@@ -169,14 +193,21 @@ func selectWorkspace(base Dependencies, raw json.RawMessage) (string, json.RawMe
 	return files.Root(), inner, base, nil
 }
 
-func splitWorkspace(raw json.RawMessage) (string, json.RawMessage, error) {
+func splitWorkspace(raw json.RawMessage, required bool) (string, json.RawMessage, error) {
 	var fields map[string]json.RawMessage
 	if err := decode(raw, &fields); err != nil {
 		return "", nil, errs.New(errs.ErrInvalidInput, "invalid tool arguments", false)
 	}
 	value, ok := fields["workspace"]
 	if !ok {
-		return "", nil, errs.New(errs.ErrWorkspaceRequired, "workspace is required", false)
+		if required {
+			return "", nil, errs.New(errs.ErrWorkspaceRequired, "workspace is required", false)
+		}
+		inner, err := json.Marshal(fields)
+		if err != nil {
+			return "", nil, errs.New(errs.ErrInvalidInput, "invalid tool arguments", false)
+		}
+		return "", inner, nil
 	}
 	var workspace string
 	if err := json.Unmarshal(value, &workspace); err != nil || strings.TrimSpace(workspace) == "" {

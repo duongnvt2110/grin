@@ -176,8 +176,9 @@ Conversation A → fs.read_text(workspace=/repo/a, path=README.md)
 Conversation B → fs.read_text(workspace=/repo/b, path=README.md)
 ```
 
-There is no conversation-to-workspace map inside Grin and no fallback to a
-random or startup workspace.
+There is no conversation-to-workspace map inside Grin. Normal mode never
+guesses or falls back; YOLO uses the configured startup workspace only when a
+scoped request omits `workspace`.
 
 → [System architecture and state ownership](docs/components.md)
 
@@ -185,11 +186,11 @@ random or startup workspace.
 
 | | Normal mode | `--yolo` |
 | --- | --- | --- |
-| Workspace model | Multiple registered workspaces | One startup workspace |
-| `workspace.list` | Yes | Yes (startup workspace only) |
-| `workspace` on filesystem/Git/shell tools | Required | Not required |
+| Workspace model | Multiple registered workspaces | Startup workspace by default; explicit requests may select any existing canonical directory |
+| `workspace.list` | Registered workspaces | Registered workspaces |
+| `workspace` on `workspace.info`, filesystem/Git/shell tools | Optional in schema; required at runtime and must be registered | Optional; omission uses startup workspace |
 | `workspace` on Codex tools | Required (registered) | Required (any existing target) |
-| Registry routing | Registered canonical path after lexical cleaning | Not used |
+| Registry routing | Required for scoped tools | Not required for explicit scoped targets |
 | Normal policy / approval | Active | Bypassed for supported tools |
 | Workspace containment | Active | Bypassed |
 | OS permissions / limits / cleanup | Active | Active |
@@ -214,7 +215,7 @@ grin [--workspace PATH] [--port PORT] [--yolo]
 | --- | --- |
 | `--workspace PATH` | Select the startup workspace. In normal mode this is not an implicit tool-call fallback. |
 | `--port PORT` | Override the default MCP port `8765`. |
-| `--yolo` | Use single-workspace YOLO behavior and bypass Grin workspace/approval restrictions for supported tools. |
+| `--yolo` | Use YOLO behavior and bypass Grin workspace/approval restrictions for supported tools. |
 | `--help` | Show help. |
 | `--version` | Print the version. |
 

@@ -14,9 +14,9 @@ func TestScopedTmuxAdapterSkipsAbsentInheritedScope(t *testing.T) {
 	t.Setenv("TMUX_PANE", "")
 	t.Setenv("PATH", t.TempDir())
 
-	observations, supported, err := readScopedTmuxTitles(context.Background())
-	if err != nil || supported || len(observations) != 0 {
-		t.Fatalf("unscoped tmux result = %#v, supported %t, err %v", observations, supported, err)
+	observations, applicable, complete, err := readScopedTmuxTitles(context.Background())
+	if err != nil || applicable || !complete || len(observations) != 0 {
+		t.Fatalf("unscoped tmux result = %#v, applicable %t, complete %t, err %v", observations, applicable, complete, err)
 	}
 }
 
@@ -27,9 +27,9 @@ func TestScopedTmuxAdapterReadsOnlyInheritedSocketAndSession(t *testing.T) {
 	t.Setenv("TMUX", "/tmp/grin-tmux.sock,12345,7")
 	t.Setenv("TMUX_PANE", "%12")
 
-	observations, supported, err := readScopedTmuxTitles(context.Background())
-	if err != nil || !supported || len(observations) != 2 {
-		t.Fatalf("scoped tmux result = %#v, supported %t, err %v", observations, supported, err)
+	observations, applicable, complete, err := readScopedTmuxTitles(context.Background())
+	if err != nil || !applicable || !complete || len(observations) != 2 {
+		t.Fatalf("scoped tmux result = %#v, applicable %t, complete %t, err %v", observations, applicable, complete, err)
 	}
 	first := observations[0]
 	if first.API != "tmux" || first.ID != "$7:%12" || first.Workspace != "/work/grin" || !first.Focused || !first.Foreground {
@@ -50,9 +50,9 @@ func TestDarwinScopedTmuxFallbackSurvivesNativeTitleAPIFailure(t *testing.T) {
 	t.Setenv("TMUX", "/tmp/grin-tmux.sock,12345,7")
 	t.Setenv("TMUX_PANE", "%12")
 
-	observations, sources, supported, _, err := readTerminalTitles(context.Background(), "darwin")
-	if err != nil || !supported || len(observations) != 2 {
-		t.Fatalf("Darwin fallback = %#v, sources %#v, supported %t, err %v", observations, sources, supported, err)
+	observations, sources, supported, complete, _, err := readTerminalTitles(context.Background(), "darwin")
+	if err != nil || !supported || complete || len(observations) != 2 {
+		t.Fatalf("Darwin fallback = %#v, sources %#v, supported %t, complete %t, err %v", observations, sources, supported, complete, err)
 	}
 	if len(sources) != 1 || sources[0] != "tmux-current-session" {
 		t.Fatalf("fallback sources = %#v", sources)

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -49,10 +50,16 @@ func TestServerInstructionsAreExposedDuringInitialization(t *testing.T) {
 		"codex.queue",
 		"exact thread_id",
 		"previous standalone task",
+		"Lookup-only requests to find, list, or inspect Codex thread IDs are read-only",
+		"when shell.run is available and authorized",
+		"Never call codex.queue solely for lookup",
+		"Use codex.queue only for a user-requested Codex send or review",
 		"grin codex discover",
 		"terminal candidates",
 		"even when there is only one eligible candidate",
 		"ask the user which one to select",
+		"same user-authorized, uninterrupted review loop for that task",
+		"Conversation history alone never carries a recipient into another task",
 		"thread title",
 		"no message queued",
 		"Never select by result order, recency",
@@ -62,8 +69,8 @@ func TestServerInstructionsAreExposedDuringInitialization(t *testing.T) {
 		"selection_required",
 		"For every new standalone send or review",
 		"omit thread_id",
-		"must still match a fresh eligible discovery result",
-		"same uninterrupted review",
+		"supplied IDs must match a fresh eligible candidate",
+		"same user-authorized, uninterrupted review loop for that task",
 		"Selection alone does not authorize sending a message or implementing code",
 		"the earlier send authorization remains applicable",
 		"server enforces technical eligibility",
@@ -174,7 +181,7 @@ func TestCodexQueueFreshRecipientRouting(t *testing.T) {
 			session, server, fake, bus, _, workspace := newCodexMCPTest(t, false, nil)
 			defer session.Close()
 			defer server.Close()
-			fake.discovery = &codex.DiscoveryResult{Status: "UNRESOLVED", Candidates: tc.candidates}
+			fake.discovery = &codex.DiscoveryResult{Status: "UNRESOLVED", Complete: true, Candidates: tc.candidates}
 			arguments := map[string]any{"message": "review"}
 			if tc.requestedID != "" {
 				arguments["thread_id"] = tc.requestedID
@@ -228,7 +235,7 @@ func TestCodexQueueDoesNotCachePreviousTaskRecipient(t *testing.T) {
 	defer session.Close()
 	defer server.Close()
 	for index, id := range []string{testThreadID, newID} {
-		fake.discovery = &codex.DiscoveryResult{Status: "UNRESOLVED", Candidates: []codex.ThreadCandidate{{
+		fake.discovery = &codex.DiscoveryResult{Status: "UNRESOLVED", Complete: true, Candidates: []codex.ThreadCandidate{{
 			ThreadID: id, WorkspaceMatch: "yes", TopLevel: "yes", Resolution: "title_uuid_correlated",
 		}}}
 		fake.queued = false
@@ -238,6 +245,36 @@ func TestCodexQueueDoesNotCachePreviousTaskRecipient(t *testing.T) {
 		if err != nil || result.IsError || !fake.queued || fake.queuedThread != id || fake.discoveryCalls != index+1 {
 			t.Fatalf("send %d reused a prior ID: result %+v, err %v, routed %q, discoveries %d", index, result, err, fake.queuedThread, fake.discoveryCalls)
 		}
+	}
+}
+
+func TestCodexQueueRejectsIncompleteDiscoveryBeforeSelection(t *testing.T) {
+	for _, requestedID := range []string{"", testThreadID} {
+		name := "omitted ID"
+		if requestedID != "" {
+			name = "explicit ID"
+		}
+		t.Run(name, func(t *testing.T) {
+			session, server, fake, _, _, workspace := newCodexMCPTest(t, false, nil)
+			defer session.Close()
+			defer server.Close()
+			fake.discovery = &codex.DiscoveryResult{Status: "UNRESOLVED", Candidates: []codex.ThreadCandidate{{
+				ThreadID: testThreadID, WorkspaceMatch: "yes", TopLevel: "yes", Resolution: "title_uuid_correlated",
+			}}}
+			arguments := map[string]any{"message": "review"}
+			if requestedID != "" {
+				arguments["thread_id"] = requestedID
+			}
+			result, err := session.CallTool(context.Background(), &sdk.CallToolParams{
+				Name: "codex.queue", Arguments: workspaceArgs(workspace, arguments),
+			})
+			if err != nil || result == nil || !result.IsError || fake.queued || fake.queueCalls != 0 || fake.discoveryCalls != 1 {
+				t.Fatalf("incomplete discovery was not rejected before selection: result=%+v err=%v fake=%+v", result, err, fake)
+			}
+			if !strings.Contains(result.Content[0].(*sdk.TextContent).Text, "incomplete") {
+				t.Fatalf("incomplete discovery error is missing: %+v", result)
+			}
+		})
 	}
 }
 
@@ -273,6 +310,7 @@ func TestCodexToolsUseExplicitWorkspaceAndNormalRegistry(t *testing.T) {
 			wanted[tool.Name] = true
 		}
 	}
+	workspaceListDescription = strings.ToLower(workspaceListDescription)
 	if !strings.Contains(workspaceListDescription, "use this only when the task's exact target path cannot be established") || !strings.Contains(workspaceListDescription, "never choose the first or only result by default") {
 		t.Fatalf("workspace.list description does not treat results as task-matched candidates: %q", workspaceListDescription)
 	}
@@ -305,6 +343,186 @@ func TestCodexToolCatalogOmitsRemovedListInYoloMode(t *testing.T) {
 		if tool.Name == "codex.list" {
 			t.Fatal("removed codex.list is still registered in YOLO mode")
 		}
+	}
+}
+
+func TestCodexToolsStillRequireWorkspaceInBothModes(t *testing.T) {
+	for _, yolo := range []bool{false, true} {
+		t.Run(map[bool]string{false: "normal", true: "yolo"}[yolo], func(t *testing.T) {
+			session, server, fake, _, _, _ := newCodexMCPTest(t, yolo, nil)
+			defer session.Close()
+			defer server.Close()
+			result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "codex.queue", Arguments: map[string]any{"message": "review"}})
+			if err != nil || result == nil || !result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceRequired)) {
+				t.Fatalf("codex.queue without workspace = %+v, err=%v", result, err)
+			}
+			if fake.discoveryCalls != 0 || fake.queueCalls != 0 {
+				t.Fatalf("missing workspace reached Codex: discover=%d queue=%d", fake.discoveryCalls, fake.queueCalls)
+			}
+		})
+	}
+}
+
+func TestToolCatalogIsStableAcrossModes(t *testing.T) {
+	readCatalog := func(yolo bool) map[string]struct {
+		description string
+		schema      []byte
+	} {
+		session, server, _, _, _, _ := newCodexMCPTest(t, yolo, nil)
+		defer session.Close()
+		defer server.Close()
+		listed, err := session.ListTools(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		catalog := make(map[string]struct {
+			description string
+			schema      []byte
+		}, len(listed.Tools))
+		for _, tool := range listed.Tools {
+			schema, err := json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal %s schema: %v", tool.Name, err)
+			}
+			catalog[tool.Name] = struct {
+				description string
+				schema      []byte
+			}{tool.Description, schema}
+		}
+		return catalog
+	}
+
+	normal := readCatalog(false)
+	yolo := readCatalog(true)
+	if len(normal) != 18 || len(yolo) != len(normal) {
+		t.Fatalf("catalog sizes: normal=%d yolo=%d, want 18 identical tools", len(normal), len(yolo))
+	}
+	for name, normalTool := range normal {
+		yoloTool, ok := yolo[name]
+		if !ok || normalTool.description != yoloTool.description || !bytes.Equal(normalTool.schema, yoloTool.schema) {
+			t.Fatalf("tool %q differs across modes: normal=%+v yolo=%+v", name, normalTool, yoloTool)
+		}
+	}
+	for _, name := range []string{
+		"workspace.info", "fs.list", "fs.stat", "fs.read_text", "fs.search", "fs.write_text", "fs.edit_text",
+		"git.status", "git.diff", "git.log", "git.show", "shell.run",
+	} {
+		var schema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+			Required   []string                   `json:"required"`
+		}
+		if err := json.Unmarshal(normal[name].schema, &schema); err != nil {
+			t.Fatalf("decode %s schema: %v", name, err)
+		}
+		if _, ok := schema.Properties["workspace"]; !ok || containsString(schema.Required, "workspace") {
+			t.Fatalf("%s workspace must be optional: schema=%s", name, normal[name].schema)
+		}
+	}
+	for _, name := range []string{"codex.queue", "codex.turn_result"} {
+		var schema struct {
+			Required []string `json:"required"`
+		}
+		if err := json.Unmarshal(normal[name].schema, &schema); err != nil {
+			t.Fatalf("decode %s schema: %v", name, err)
+		}
+		if !containsString(schema.Required, "workspace") {
+			t.Fatalf("%s workspace must remain required: schema=%s", name, normal[name].schema)
+		}
+	}
+	var listSchema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(normal["workspace.list"].schema, &listSchema); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := listSchema.Properties["workspace"]; ok {
+		t.Fatal("workspace.list must remain global")
+	}
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func TestYOLOWorkspaceListAlwaysUsesRegistry(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		setup      func(*testing.T, string) string
+		wantError  errs.ErrorCode
+		wantListed bool
+	}{
+		{name: "missing registry is empty"},
+		{
+			name: "registered paths only",
+			setup: func(t *testing.T, home string) string {
+				t.Setenv("HOME", home)
+				registered := t.TempDir()
+				canonical, err := config.RegisterWorkspace(registered)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return canonical
+			},
+			wantListed: true,
+		},
+		{
+			name: "corrupt registry is unavailable",
+			setup: func(t *testing.T, home string) string {
+				t.Setenv("HOME", home)
+				path := filepath.Join(home, ".grin", "config.yaml")
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("workspaces: ["), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return ""
+			},
+			wantError: errs.ErrWorkspaceUnavailable,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			registered := ""
+			if test.setup != nil {
+				registered = test.setup(t, home)
+			}
+			session, server, _, _, _, startup := newCodexMCPTest(t, true, nil)
+			defer session.Close()
+			defer server.Close()
+			result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.list", Arguments: map[string]any{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.wantError != "" {
+				if !result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, string(test.wantError)) {
+					t.Fatalf("workspace.list = %+v, want %s", result, test.wantError)
+				}
+				return
+			}
+			if result.IsError {
+				t.Fatalf("workspace.list failed: %+v", result)
+			}
+			var payload struct {
+				Workspaces []string `json:"workspaces"`
+			}
+			if err := json.Unmarshal([]byte(result.Content[0].(*sdk.TextContent).Text), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if test.wantListed {
+				if len(payload.Workspaces) != 1 || payload.Workspaces[0] != registered {
+					t.Fatalf("workspace.list = %v, want only registered %q (startup %q must not be invented)", payload.Workspaces, registered, startup)
+				}
+			} else if len(payload.Workspaces) != 0 {
+				t.Fatalf("missing registry returned %v, want empty", payload.Workspaces)
+			}
+		})
 	}
 }
 
@@ -504,7 +722,7 @@ func (f *fakeCodexTools) Discover(_ context.Context, workspace string) (codex.Di
 	if f.discovery != nil {
 		return *f.discovery, nil
 	}
-	return codex.DiscoveryResult{Status: "UNRESOLVED", Candidates: []codex.ThreadCandidate{{
+	return codex.DiscoveryResult{Status: "UNRESOLVED", Complete: true, Candidates: []codex.ThreadCandidate{{
 		TerminalObservation: codex.TerminalObservation{ID: "term-a"},
 		ThreadID:            testThreadID, ThreadTitle: "default test recipient", WorkspaceMatch: "yes",
 		TopLevel: "yes", Resolution: "title_uuid_correlated",
@@ -1198,11 +1416,14 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 	if result.IsError || result.StructuredContent == nil {
 		t.Fatalf("unexpected read result: %+v", result)
 	}
-	for _, want := range []events.EventType{events.EventRequestStarted, events.EventToolCompleted} {
+	for _, want := range []events.EventType{events.EventRequestStarted, events.EventPolicyDecision, events.EventToolCompleted} {
 		select {
 		case event := <-subscription.Events:
 			if event.Type != want {
 				t.Fatalf("event type = %s, want %s", event.Type, want)
+			}
+			if event.Type == events.EventPolicyDecision && event.Workspace != files.Root() {
+				t.Fatalf("policy decision workspace = %q, want %q", event.Workspace, files.Root())
 			}
 			if event.Type == events.EventToolCompleted && event.Summary != "note.txt" {
 				t.Fatalf("read completion summary = %q, want note.txt", event.Summary)
@@ -1239,7 +1460,7 @@ func TestStreamableHTTPReadWorkflow(t *testing.T) {
 	if err != nil || searchResult.IsError {
 		t.Fatalf("search result = %+v, err=%v", searchResult, err)
 	}
-	for _, want := range []events.EventType{events.EventRequestStarted, events.EventToolCompleted} {
+	for _, want := range []events.EventType{events.EventRequestStarted, events.EventPolicyDecision, events.EventToolCompleted} {
 		select {
 		case event := <-subscription.Events:
 			if event.Type != want {
@@ -1593,13 +1814,41 @@ func TestStreamableHTTPShellDisplayRedactsEnvironmentAssignments(t *testing.T) {
 func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 	root := t.TempDir()
 	registerTestWorkspace(t, root)
+	registered := t.TempDir()
+	canonicalRegistered, err := config.RegisterWorkspace(registered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered = canonicalRegistered
 	outside := t.TempDir()
+	outside, err = filepath.EvalSymlinks(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(outside, "note.txt"), []byte("outside"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(registered, "note.txt"), []byte("registered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(outside, ".grin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, config.WorkspaceConfigPath), []byte("version: 1\nlimits:\n  max_shell_stdout_bytes: 1\nshell:\n  allowed_environment:\n    - TARGET_ONLY\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitInitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	gitInit := exec.CommandContext(gitInitCtx, "git", "-C", outside, "init", "-q")
+	if output, err := gitInit.CombinedOutput(); err != nil {
+		t.Fatalf("initialize test repository: %v: %s", err, output)
 	}
 	cfg := config.Defaults()
 	cfg.Workspace.Root = root
 	cfg.Yolo = true
+	cfg.Limits.MaxShellStdoutBytes = 1024
+	cfg.Shell.AllowedEnvironment = append(cfg.Shell.AllowedEnvironment, "GRIN_ROUTING_STARTUP_ENV")
+	t.Setenv("GRIN_ROUTING_STARTUP_ENV", "startup-shell-setting")
 	files, err := filesystem.New(root, cfg.Limits, cfg.Yolo)
 	if err != nil {
 		t.Fatal(err)
@@ -1608,7 +1857,7 @@ func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bus := events.New(20)
+	bus := events.New(100)
 	manager := approval.New(bus, time.Second)
 	httpServer := httptest.NewServer(Handler(NewServer(Dependencies{Filesystem: files, Runtime: runtimeService, Config: cfg, Version: "test", Events: bus, Approval: manager, Policy: policy.New(cfg.Yolo)})))
 	defer httpServer.Close()
@@ -1635,7 +1884,11 @@ func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 	}
 
 	listed, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.list", Arguments: map[string]any{}})
-	if err != nil || listed.IsError || !strings.Contains(listed.Content[0].(*sdk.TextContent).Text, root) {
+	if err != nil || listed == nil || listed.IsError {
+		t.Fatalf("YOLO workspace.list = %+v, err=%v", listed, err)
+	}
+	listedText := listed.Content[0].(*sdk.TextContent).Text
+	if !strings.Contains(listedText, root) || !strings.Contains(listedText, registered) || strings.Contains(listedText, outside) {
 		t.Fatalf("YOLO workspace.list = %+v, err=%v", listed, err)
 	}
 
@@ -1647,41 +1900,71 @@ func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 	if !ok || info["yolo"] != true {
 		t.Fatalf("workspace.info = %#v", infoResult.StructuredContent)
 	}
+	if info["root"] != files.Root() {
+		t.Fatalf("implicit YOLO workspace.info root = %v, want %s", info["root"], files.Root())
+	}
 
-	legacyInfo, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.info", Arguments: workspaceArgs(root, map[string]any{})})
-	if err != nil || legacyInfo.IsError {
-		t.Fatalf("YOLO legacy workspace.info = %+v, err=%v", legacyInfo, err)
+	registeredInfo, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.info", Arguments: workspaceArgs(registered, map[string]any{})})
+	if err != nil || registeredInfo.IsError || registeredInfo.StructuredContent.(map[string]any)["root"] != registered {
+		t.Fatalf("YOLO registered workspace.info = %+v, err=%v", registeredInfo, err)
+	}
+	explicitInfo, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "workspace.info", Arguments: workspaceArgs(outside, map[string]any{})})
+	if err != nil || explicitInfo.IsError || explicitInfo.StructuredContent.(map[string]any)["root"] != outside {
+		t.Fatalf("YOLO unregistered workspace.info = %+v, err=%v", explicitInfo, err)
 	}
 
 	notePath := filepath.Join(root, "note.txt")
 	if err := os.WriteFile(notePath, []byte("yolo"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	legacyRead, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(root, map[string]any{"path": "note.txt"})})
-	if err != nil || legacyRead.IsError {
-		t.Fatalf("YOLO legacy fs.read_text = %+v, err=%v", legacyRead, err)
+	implicitRead, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: map[string]any{"path": "note.txt"}})
+	if err != nil || implicitRead.IsError || !strings.Contains(implicitRead.Content[0].(*sdk.TextContent).Text, "yolo") {
+		t.Fatalf("YOLO implicit fs.read_text = %+v, err=%v", implicitRead, err)
 	}
 
-	rejectedPath := filepath.Join(outside, "rejected.txt")
-	mismatched, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: workspaceArgs(outside, map[string]any{"path": rejectedPath, "content": "must not write"})})
-	if err != nil || !mismatched.IsError || !strings.Contains(mismatched.Content[0].(*sdk.TextContent).Text, string(errs.ErrInvalidInput)) {
-		t.Fatalf("YOLO mismatched workspace = %+v, err=%v", mismatched, err)
+	registeredRead, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(registered, map[string]any{"path": "note.txt"})})
+	if err != nil || registeredRead.IsError || !strings.Contains(registeredRead.Content[0].(*sdk.TextContent).Text, "registered") {
+		t.Fatalf("YOLO registered fs.read_text = %+v, err=%v", registeredRead, err)
 	}
-	if _, err := os.Stat(rejectedPath); !os.IsNotExist(err) {
-		t.Fatalf("mismatched workspace created %q, stat err=%v", rejectedPath, err)
+
+	explicitRead, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(outside, map[string]any{"path": "note.txt"})})
+	if err != nil || explicitRead.IsError || !strings.Contains(explicitRead.Content[0].(*sdk.TextContent).Text, "outside") {
+		t.Fatalf("YOLO unregistered fs.read_text = %+v, err=%v", explicitRead, err)
+	}
+	failedRead, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.read_text", Arguments: workspaceArgs(outside, map[string]any{"path": "missing.txt"})})
+	if err != nil || !failedRead.IsError {
+		t.Fatalf("YOLO selected-root failed read = %+v, err=%v", failedRead, err)
+	}
+	writePath := filepath.Join(outside, "new.txt")
+	writeResult, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: workspaceArgs(outside, map[string]any{"path": "new.txt", "content": "yolo"})})
+	if err != nil || writeResult.IsError {
+		t.Fatalf("YOLO unregistered fs.write_text = %+v, err=%v", writeResult, err)
 	}
 
 	for _, call := range []struct {
 		name string
 		args map[string]any
 	}{
-		{name: "fs.read_text", args: map[string]any{"path": filepath.Join(outside, "note.txt")}},
-		{name: "fs.write_text", args: map[string]any{"path": filepath.Join(outside, "new.txt"), "content": "yolo"}},
-		{name: "shell.run", args: map[string]any{"command": "pwd", "cwd": outside}},
+		{name: "git.status", args: workspaceArgs(outside, map[string]any{})},
+		{name: "shell.run", args: workspaceArgs(outside, map[string]any{"command": "cat", "args": []string{"note.txt"}})},
+		{name: "shell.run", args: workspaceArgs(outside, map[string]any{"command": "printenv", "args": []string{"GRIN_ROUTING_STARTUP_ENV"}})},
+		{name: "shell.run", args: workspaceArgs(outside, map[string]any{"command": "printf", "args": []string{"xx"}})},
 	} {
 		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: call.name, Arguments: call.args})
 		if callErr != nil || result.IsError {
-			t.Fatalf("YOLO %s result = %+v, err=%v", call.name, result, callErr)
+			t.Fatalf("YOLO %s args=%v result = %+v, err=%v", call.name, call.args, result, callErr)
+		}
+		if call.name == "git.status" && !strings.Contains(result.Content[0].(*sdk.TextContent).Text, "new.txt") {
+			t.Fatalf("YOLO git.status did not use selected root: %+v", result)
+		}
+		if call.name == "shell.run" && call.args["command"] == "cat" && result.StructuredContent.(map[string]any)["stdout"] != "outside" {
+			t.Fatalf("YOLO shell.run did not use selected root: %+v", result.StructuredContent)
+		}
+		if call.name == "shell.run" && call.args["command"] == "printenv" && result.StructuredContent.(map[string]any)["stdout"] != "startup-shell-setting\n" {
+			t.Fatalf("YOLO shell.run did not use startup shell settings: %+v", result.StructuredContent)
+		}
+		if call.name == "shell.run" && call.args["command"] == "printf" && result.StructuredContent.(map[string]any)["stdout"] != "xx" {
+			t.Fatalf("YOLO shell.run did not use startup output limit: %+v", result.StructuredContent)
 		}
 	}
 	for _, event := range bus.Snapshot() {
@@ -1689,9 +1972,88 @@ func TestStreamableHTTPYoloBypassesApprovalAndContainment(t *testing.T) {
 			t.Fatal("YOLO operation unexpectedly created an approval request")
 		}
 	}
-	data, err := os.ReadFile(filepath.Join(outside, "new.txt"))
+	data, err := os.ReadFile(writePath)
 	if err != nil || string(data) != "yolo" {
 		t.Fatalf("YOLO outside write = %q, err=%v", data, err)
+	}
+	for _, scopedTool := range []string{"workspace.info", "fs.read_text", "fs.write_text", "git.status", "shell.run"} {
+		seenStart, seenCompletion, seenFailure, seenPolicy := false, false, false, false
+		for _, event := range bus.Snapshot() {
+			if event.Tool != scopedTool {
+				continue
+			}
+			if event.Type == events.EventRequestStarted && event.Workspace == outside {
+				seenStart = true
+			}
+			if event.Type == events.EventToolCompleted && event.Workspace == outside {
+				seenCompletion = true
+			}
+			if event.Type == events.EventToolFailed && event.Workspace == outside {
+				seenFailure = true
+			}
+			if event.Type == events.EventPolicyDecision && event.Workspace == outside {
+				seenPolicy = true
+			}
+		}
+		if !seenStart || !seenCompletion || !seenPolicy || (scopedTool == "fs.read_text" && !seenFailure) {
+			t.Fatalf("YOLO %s event attribution missing: start=%t completion=%t failure=%t policy=%t", scopedTool, seenStart, seenCompletion, seenFailure, seenPolicy)
+		}
+	}
+	implicitStarted := false
+	for _, event := range bus.Snapshot() {
+		if event.Tool == "workspace.info" && event.Type == events.EventRequestStarted && event.Workspace == files.Root() {
+			implicitStarted = true
+		}
+	}
+	if !implicitStarted {
+		t.Fatal("implicit YOLO workspace was not attributed to the startup root")
+	}
+	for _, badWorkspace := range []struct {
+		value string
+		code  errs.ErrorCode
+	}{
+		{value: "", code: errs.ErrInvalidInput},
+		{value: "relative", code: errs.ErrInvalidInput},
+		{value: filepath.Join(t.TempDir(), "missing"), code: errs.ErrWorkspaceUnavailable},
+	} {
+		result, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: map[string]any{"workspace": badWorkspace.value, "path": "must-not-exist", "content": "no"}})
+		if callErr != nil || !result.IsError || !strings.Contains(result.Content[0].(*sdk.TextContent).Text, string(badWorkspace.code)) {
+			t.Fatalf("invalid YOLO workspace %q = %+v, err=%v", badWorkspace.value, result, callErr)
+		}
+		if _, err := os.Stat(filepath.Join(root, "must-not-exist")); !os.IsNotExist(err) {
+			t.Fatalf("invalid YOLO workspace %q fell back to startup root: stat err=%v", badWorkspace.value, err)
+		}
+	}
+	selectionFailureUnscoped := false
+	for _, event := range bus.Snapshot() {
+		if event.Tool == "fs.write_text" && event.Type == events.EventToolFailed && event.Summary == "workspace selection failed" {
+			if event.Workspace != "" {
+				t.Fatalf("invalid workspace failure exposed unresolved workspace %q", event.Workspace)
+			}
+			selectionFailureUnscoped = true
+		}
+	}
+	if !selectionFailureUnscoped {
+		t.Fatal("invalid workspace selection did not publish an unscoped failure")
+	}
+	nonDirectory := filepath.Join(t.TempDir(), "workspace-file")
+	if err := os.WriteFile(nonDirectory, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nonDirectoryResult, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: map[string]any{"workspace": nonDirectory, "path": "must-not-exist", "content": "no"}})
+	if err != nil || !nonDirectoryResult.IsError || !strings.Contains(nonDirectoryResult.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceUnavailable)) {
+		t.Fatalf("YOLO non-directory workspace = %+v, err=%v", nonDirectoryResult, err)
+	}
+	symlink := filepath.Join(t.TempDir(), "outside-link")
+	if err := os.Symlink(outside, symlink); err != nil {
+		t.Fatal(err)
+	}
+	aliasResult, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "fs.write_text", Arguments: map[string]any{"workspace": symlink, "path": "must-not-exist", "content": "no"}})
+	if err != nil || !aliasResult.IsError || !strings.Contains(aliasResult.Content[0].(*sdk.TextContent).Text, string(errs.ErrWorkspaceUnavailable)) {
+		t.Fatalf("YOLO symlink workspace = %+v, err=%v", aliasResult, err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "must-not-exist")); !os.IsNotExist(err) {
+		t.Fatalf("YOLO symlink alias was followed: stat err=%v", err)
 	}
 }
 
